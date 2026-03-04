@@ -1,11 +1,11 @@
 import logging
 import os
 import re
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from yt_dlp import YoutubeDL
 
-# Configurar logging (CORRIGIDO: sem barras invertidas)
+# Configurar logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Token do bot (configurado pelo usuário)
 TOKEN = "8522636592:AAGGKm59cxMC5PYyjr3Dil1PZRG21C47a0g"
 
-# Diretório para downloads temporários (CORRIGIDO: pasta local para evitar erro de permissão)
+# Diretório para downloads temporários
 DOWNLOAD_DIR = "downloads"
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
@@ -28,16 +28,35 @@ async def start(update: Update, context) -> None:
 async def send_progress_message(update: Update, text: str):
     await update.message.reply_text(text)
 
-# Função para baixar mídia
-async def download_media(update: Update, context) -> None:
+# Função para lidar com a entrada do usuário (link ou nome)
+async def handle_user_input(update: Update, context) -> None:
     user_input = update.message.text
-    chat_id = update.message.chat_id
+    context.user_data["user_input"] = user_input # Armazenar a entrada do usuário
 
-    await send_progress_message(update, f"Recebido: {user_input}. Processando...")
+    keyboard = [
+        [InlineKeyboardButton("Baixar como Vídeo (MP4)", callback_data="download_video")],
+        [InlineKeyboardButton("Baixar como Música (MP3)", callback_data="download_audio")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text("O que você gostaria de baixar?", reply_markup=reply_markup)
+
+# Função para lidar com a escolha do botão (callback)
+async def button_callback_handler(update: Update, context) -> None:
+    query = update.callback_query
+    await query.answer() # Responder ao callback para remover o estado de 'carregando' do botão
+
+    user_input = context.user_data.get("user_input")
+    if not user_input:
+        await query.edit_message_text("Desculpe, não consegui recuperar sua última solicitação. Por favor, envie novamente.")
+        return
+
+    download_as_audio = query.data == "download_audio"
+
+    await query.edit_message_text(f"Recebido: {user_input}. Processando como {'Música' if download_as_audio else 'Vídeo'}...")
 
     is_url = re.match(r"https?://[^\s]+\.\S+", user_input)
 
-    # Configurações do yt-dlp (CORRIGIDO: outtmpl usando pasta local)
     ydl_opts = {
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
@@ -47,13 +66,15 @@ async def download_media(update: Update, context) -> None:
         "merge_output_format": "mp4",
     }
 
-    # Se for busca por música (contém a palavra music ou música), extrair áudio
-    if not is_url and ("music" in user_input.lower() or "música" in user_input.lower()):
+    if download_as_audio:
         ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
+        # Se for uma busca por nome e o usuário escolheu música, garantir que o yt-dlp tente buscar áudio
+        if not is_url:
+            user_input = f"ytsearch1:{user_input} audio"
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
@@ -71,21 +92,20 @@ async def download_media(update: Update, context) -> None:
                 
                 # Pega o primeiro resultado da busca
                 first_result = search_results["entries"][0]
-                await send_progress_message(update, f"Encontrado: {first_result['title']}. Baixando...")
+                await send_progress_message(update, f"Encontrado: {first_result["title"]}. Baixando...")
                 info = ydl.extract_info(first_result["webpage_url"], download=True)
 
-            # Preparar o caminho do arquivo final
             file_path = ydl.prepare_filename(info)
             
             # Se foi convertido para mp3, o yt-dlp muda a extensão no disco mas não necessariamente no info
-            if not file_path.endswith(".mp3") and os.path.exists(file_path.rsplit(".", 1)[0] + ".mp3"):
+            if download_as_audio and not file_path.endswith(".mp3") and os.path.exists(file_path.rsplit(".", 1)[0] + ".mp3"):
                 file_path = file_path.rsplit(".", 1)[0] + ".mp3"
 
             await send_progress_message(update, "Download concluído, enviando...")
             
             # Enviar o arquivo para o Telegram
             with open(file_path, "rb") as document:
-                await update.message.reply_document(document=document)
+                await update.callback_query.message.reply_document(document=document)
             
             # Remover o arquivo após o envio para economizar espaço
             os.remove(file_path)
@@ -97,16 +117,15 @@ async def download_media(update: Update, context) -> None:
 
 def download_progress_hook(d, update: Update):
     if d["status"] == "finished":
-        # logger.info("Download concluído no disco.")
         pass
 
 def main() -> None:
-    # Iniciar a aplicação do bot
     application = Application.builder().token(TOKEN).build()
 
     # Handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_media))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_input))
+    application.add_handler(CallbackQueryHandler(button_callback_handler))
 
     # Rodar o bot
     logger.info("Bot TM-Infinity iniciado...")
