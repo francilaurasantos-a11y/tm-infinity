@@ -8,13 +8,16 @@ from yt_dlp import YoutubeDL
 
 # Configurar logging
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format=\'%(asctime)s - %(name)s - %(levelname)s - %(message)s\',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # Token do bot (substituído pelo token fornecido pelo usuário)
 TOKEN = '8522636592:AAGGKm59cxMC5PYyjr3Dil1PZRG21C47a0g'
+
+# Diretório para downloads temporários
+DOWNLOAD_DIR = 'downloads'
 
 # Função para iniciar o bot
 async def start(update: Update, context) -> None:
@@ -33,9 +36,12 @@ async def download_media(update: Update, context) -> None:
 
     is_url = re.match(r'https?://[^\s]+\.\S+', user_input)
 
+    # Criar o diretório de downloads se não existir
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': f'/tmp/%(title)s.%(ext)s',
+        'outtmpl': f'{DOWNLOAD_DIR}/%(title)s.%(ext)s',
         'noplaylist': True,
         'progress_hooks': [lambda d: download_progress_hook(d, update)],
         'postprocessors': [{
