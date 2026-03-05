@@ -22,13 +22,31 @@ DOWNLOAD_DIR = "downloads"
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
 
+# Dicionário para armazenar o ID da mensagem de progresso para cada chat
+progress_messages = {}
+
+# Função para gerar a barra de progresso
+def create_progress_bar(progress: float, bar_length: int = 20) -> str:
+    filled_length = int(bar_length * progress)
+    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+    return f"[{bar}] {progress:.1%}"
+
 # Função para iniciar o bot
 async def start(update: Update, context) -> None:
     await update.message.reply_text("Olá! Eu sou o bot TM-Infinity. Envie-me um link de vídeo/música ou o nome para baixar.")
 
-# Função auxiliar para enviar mensagens de progresso
-async def send_progress_message(message_object, text: str):
-    await message_object.reply_text(text)
+# Função auxiliar para enviar/editar mensagens de progresso
+async def send_or_edit_progress_message(chat_id: int, message_object, text: str):
+    if chat_id in progress_messages:
+        try:
+            await message_object.edit_text(text)
+        except Exception:
+            # Se a mensagem não puder ser editada (ex: muito antiga), envia uma nova
+            new_message = await message_object.reply_text(text)
+            progress_messages[chat_id] = new_message.message_id
+    else:
+        new_message = await message_object.reply_text(text)
+        progress_messages[chat_id] = new_message.message_id
 
 # Função para extrair link direto de MediaFire (mantida, mas não usada para APKs)
 async def get_mediafire_direct_link(url: str) -> str | None:
@@ -112,22 +130,29 @@ async def button_callback_handler(update: Update, context) -> None:
                     await send_progress_message(query.message, "Não foi possível encontrar itens na playlist ou a URL não é de uma playlist válida.")
                     return
                 
-                await send_progress_message(query.message, f"Encontradas {len(info_dict["entries"])} músicas na playlist. Iniciando downloads...")
+                total_tracks = len(info_dict["entries"])
+                await send_progress_message(query.message, f"Encontradas {total_tracks} músicas na playlist. Iniciando downloads...")
 
-                for entry in info_dict["entries"]:
+                for i, entry in enumerate(info_dict["entries"]):
                     if entry:
                         try:
-                            await send_progress_message(query.message, f"Baixando: {entry["title"]}...")
+                            current_track_message = f"Baixando {i+1} de {total_tracks}: {entry["title"]}...\n{create_progress_bar(0)}"
+                            progress_msg = await query.message.reply_text(current_track_message)
+                            
                             # Baixar e processar cada item individualmente
-                            single_track_info = ydl.extract_info(entry["url"], download=True)
-                            file_path = ydl.prepare_filename(single_track_info)
+                            single_track_ydl_opts = ydl_opts_playlist.copy()
+                            single_track_ydl_opts["progress_hooks"] = [lambda d, msg=progress_msg: download_progress_hook(d, msg)]
+                            
+                            single_track_ydl = YoutubeDL(single_track_ydl_opts)
+                            single_track_info = single_track_ydl.extract_info(entry["url"], download=True)
+                            file_path = single_track_ydl.prepare_filename(single_track_info)
                             
                             # Garantir que o arquivo é .mp3
                             mp3_path = os.path.splitext(file_path)[0] + ".mp3"
                             if os.path.exists(mp3_path):
                                 file_path = mp3_path
                             
-                            await send_progress_message(query.message, f"Enviando: {entry["title"]}...")
+                            await progress_msg.edit_text(f"Enviando {i+1} de {total_tracks}: {entry["title"]}...")
                             with open(file_path, "rb") as document:
                                 await query.message.reply_document(document=document)
                             
@@ -136,7 +161,7 @@ async def button_callback_handler(update: Update, context) -> None:
 
                         except Exception as e_track:
                             logger.error(f"Erro ao baixar ou enviar música da playlist {entry.get("title", "")}: {e_track}", exc_info=True)
-                            await send_progress_message(query.message, f"Erro ao baixar {entry.get("title", "")}: {e_track}")
+                            await query.message.reply_text(f"Erro ao baixar {entry.get("title", "")}: {e_track}")
                 
                 await send_progress_message(query.message, "Download da playlist concluído!")
 
@@ -200,9 +225,27 @@ async def button_callback_handler(update: Update, context) -> None:
         logger.error(f"Erro ao baixar mídia: {e}", exc_info=True)
         await send_progress_message(query.message, f"Ocorreu um erro ao baixar a mídia: {e}")
 
-def download_progress_hook(d, message_object):
-    if d["status"] == "finished":
-        pass
+# A função download_progress_hook agora recebe o objeto message correto
+async def download_progress_hook(d, message_object):
+    if d["status"] == "downloading":
+        total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate")
+        downloaded_bytes = d.get("downloaded_bytes", 0)
+        if total_bytes:
+            progress = downloaded_bytes / total_bytes
+            speed = d.get("speed")
+            eta = d.get("eta")
+
+            progress_bar = create_progress_bar(progress)
+            status_text = f"Baixando: {progress_bar}"
+            if speed: status_text += f" | Velocidade: {speed / 1024:.2f} KiB/s"
+            if eta: status_text += f" | ETA: {eta}s"
+            
+            try:
+                await message_object.edit_text(status_text)
+            except Exception as e:
+                logger.debug(f"Erro ao editar mensagem de progresso: {e}")
+    elif d["status"] == "finished":
+        await message_object.edit_text("Download concluído. Processando...")
 
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
