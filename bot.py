@@ -30,13 +30,12 @@ async def start(update: Update, context) -> None:
 async def send_progress_message(message_object, text: str):
     await message_object.reply_text(text)
 
-# Função para extrair link direto de MediaFire
+# Função para extrair link direto de MediaFire (mantida, mas não usada para APKs)
 async def get_mediafire_direct_link(url: str) -> str | None:
     try:
         response = requests.get(url)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
-        # O link de download direto geralmente está em um botão com a classe 'download_link' ou similar
         download_button = soup.find('a', class_='download_link')
         if download_button and download_button.has_attr('href'):
             return download_button['href']
@@ -55,9 +54,11 @@ async def handle_user_input(update: Update, context) -> None:
         [InlineKeyboardButton("Baixar como Música (MP3)", callback_data="download_audio")],
     ]
     
-    # Adicionar botão para baixar arquivo genérico APENAS se for uma URL
+    # Adicionar botão para baixar playlist APENAS se for uma URL
     if re.match(r"https?://[^\s]+\.\S+", user_input):
-        keyboard.append([InlineKeyboardButton("Baixar como Arquivo/APK", callback_data="download_file")])
+        # Verificar se a URL pode ser uma playlist (ex: youtube.com/playlist, spotify.com/playlist)
+        if "playlist" in user_input.lower() or "list=" in user_input.lower():
+            keyboard.append([InlineKeyboardButton("Baixar Playlist de Música", callback_data="download_playlist_audio")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -81,56 +82,68 @@ async def button_callback_handler(update: Update, context) -> None:
 
     is_url = re.match(r"https?://[^\s]+\.\S+", original_user_input)
 
-    if download_type == "download_file":
+    # Lógica para download de playlist
+    if download_type == "download_playlist_audio":
         if not is_url:
-            await send_progress_message(query.message, "Para baixar como arquivo, por favor, forneça um link direto.")
+            await send_progress_message(query.message, "Para baixar uma playlist, por favor, forneça um link de playlist.")
             return
         
-        download_url = original_user_input
-        # Verificar se é um link do MediaFire e tentar extrair o link direto
-        if "mediafire.com" in original_user_input:
-            await send_progress_message(query.message, "Detectado link do MediaFire. Tentando extrair link direto...")
-            direct_link = await get_mediafire_direct_link(original_user_input)
-            if direct_link:
-                download_url = direct_link
-                await send_progress_message(query.message, "Link direto do MediaFire extraído com sucesso.")
-            else:
-                await send_progress_message(query.message, "Não foi possível extrair o link direto do MediaFire. Tentando baixar a URL original.")
+        await send_progress_message(query.message, f"Iniciando download da playlist: {original_user_input}...")
+        
+        ydl_opts_playlist = {
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(DOWNLOAD_DIR, "%(playlist_index)s - %(title)s.%(ext)s"),
+            "noplaylist": False, # Permitir playlists
+            "extract_flat": False, # Extrair informações completas de cada item
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+            "restrictfilenames": True,
+            "merge_output_format": "mp3",
+        }
 
         try:
-            await send_progress_message(query.message, f"Baixando arquivo de: {download_url}...")
-            response = requests.get(download_url, stream=True)
-            response.raise_for_status() # Levanta um erro para códigos de status HTTP ruins
+            with YoutubeDL(ydl_opts_playlist) as ydl:
+                info_dict = ydl.extract_info(original_user_input, download=False) # Apenas extrair info da playlist
+                
+                if "entries" not in info_dict:
+                    await send_progress_message(query.message, "Não foi possível encontrar itens na playlist ou a URL não é de uma playlist válida.")
+                    return
+                
+                await send_progress_message(query.message, f"Encontradas {len(info_dict["entries"])} músicas na playlist. Iniciando downloads...")
 
-            # Tentar obter o nome do arquivo do cabeçalho Content-Disposition ou da URL
-            filename = None
-            if "Content-Disposition" in response.headers:
-                fname_match = re.findall(r"filename=\"?([^\"]+)\"?", response.headers["Content-Disposition"])
-                if fname_match: filename = fname_match[0]
-            
-            if not filename:
-                filename = os.path.basename(download_url.split("?")[0])
-                if not filename or len(filename.split(".")) < 2: # Se não tiver nome ou extensão, usar um padrão
-                    filename = "downloaded_file.bin"
+                for entry in info_dict["entries"]:
+                    if entry:
+                        try:
+                            await send_progress_message(query.message, f"Baixando: {entry["title"]}...")
+                            # Baixar e processar cada item individualmente
+                            single_track_info = ydl.extract_info(entry["url"], download=True)
+                            file_path = ydl.prepare_filename(single_track_info)
+                            
+                            # Garantir que o arquivo é .mp3
+                            mp3_path = os.path.splitext(file_path)[0] + ".mp3"
+                            if os.path.exists(mp3_path):
+                                file_path = mp3_path
+                            
+                            await send_progress_message(query.message, f"Enviando: {entry["title"]}...")
+                            with open(file_path, "rb") as document:
+                                await query.message.reply_document(document=document)
+                            
+                            os.remove(file_path) # Apagar do armazenamento após enviar
+                            logger.info(f"Música {file_path} da playlist enviada e removida com sucesso.")
 
-            file_path = os.path.join(DOWNLOAD_DIR, filename)
-
-            with open(file_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            await send_progress_message(query.message, "Download concluído, enviando...")
-            
-            with open(file_path, "rb") as document:
-                await query.message.reply_document(document=document)
-            
-            os.remove(file_path)
-            logger.info(f"Arquivo {file_path} enviado e removido com sucesso.")
+                        except Exception as e_track:
+                            logger.error(f"Erro ao baixar ou enviar música da playlist {entry.get("title", "")}: {e_track}", exc_info=True)
+                            await send_progress_message(query.message, f"Erro ao baixar {entry.get("title", "")}: {e_track}")
+                
+                await send_progress_message(query.message, "Download da playlist concluído!")
 
         except Exception as e:
-            logger.error(f"Erro ao baixar arquivo: {e}", exc_info=True)
-            await send_progress_message(query.message, f"Ocorreu um erro ao baixar o arquivo: {e}")
-        return # Finaliza a função para download de arquivo
+            logger.error(f"Erro ao processar playlist: {e}", exc_info=True)
+            await send_progress_message(query.message, f"Ocorreu um erro ao processar a playlist: {e}")
+        return # Finaliza a função para download de playlist
 
     # Lógica existente para vídeo e áudio (yt-dlp)
     ydl_opts = {
