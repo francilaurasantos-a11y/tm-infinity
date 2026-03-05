@@ -1,10 +1,11 @@
 import logging
 import os
 import re
-import requests # Importar a biblioteca requests
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from yt_dlp import YoutubeDL
+from bs4 import BeautifulSoup # Importar BeautifulSoup
 
 # Configurar logging
 logging.basicConfig(
@@ -28,6 +29,20 @@ async def start(update: Update, context) -> None:
 # Função auxiliar para enviar mensagens de progresso
 async def send_progress_message(message_object, text: str):
     await message_object.reply_text(text)
+
+# Função para extrair link direto de MediaFire
+async def get_mediafire_direct_link(url: str) -> str | None:
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        # O link de download direto geralmente está em um botão com a classe 'download_link' ou similar
+        download_button = soup.find('a', class_='download_link')
+        if download_button and download_button.has_attr('href'):
+            return download_button['href']
+    except Exception as e:
+        logger.error(f"Erro ao extrair link do MediaFire: {e}", exc_info=True)
+    return None
 
 # Função para lidar com a entrada do usuário (link ou nome)
 async def handle_user_input(update: Update, context) -> None:
@@ -71,9 +86,20 @@ async def button_callback_handler(update: Update, context) -> None:
             await send_progress_message(query.message, "Para baixar como arquivo, por favor, forneça um link direto.")
             return
         
+        download_url = original_user_input
+        # Verificar se é um link do MediaFire e tentar extrair o link direto
+        if "mediafire.com" in original_user_input:
+            await send_progress_message(query.message, "Detectado link do MediaFire. Tentando extrair link direto...")
+            direct_link = await get_mediafire_direct_link(original_user_input)
+            if direct_link:
+                download_url = direct_link
+                await send_progress_message(query.message, "Link direto do MediaFire extraído com sucesso.")
+            else:
+                await send_progress_message(query.message, "Não foi possível extrair o link direto do MediaFire. Tentando baixar a URL original.")
+
         try:
-            await send_progress_message(query.message, f"Baixando arquivo de: {original_user_input}...")
-            response = requests.get(original_user_input, stream=True)
+            await send_progress_message(query.message, f"Baixando arquivo de: {download_url}...")
+            response = requests.get(download_url, stream=True)
             response.raise_for_status() # Levanta um erro para códigos de status HTTP ruins
 
             # Tentar obter o nome do arquivo do cabeçalho Content-Disposition ou da URL
@@ -83,7 +109,7 @@ async def button_callback_handler(update: Update, context) -> None:
                 if fname_match: filename = fname_match[0]
             
             if not filename:
-                filename = os.path.basename(original_user_input.split("?")[0])
+                filename = os.path.basename(download_url.split("?")[0])
                 if not filename or len(filename.split(".")) < 2: # Se não tiver nome ou extensão, usar um padrão
                     filename = "downloaded_file.bin"
 
@@ -128,12 +154,10 @@ async def button_callback_handler(update: Update, context) -> None:
             if is_url:
                 info = ydl.extract_info(original_user_input, download=True)
             else:
-                # CORREÇÃO: Apenas passa o termo de busca original para yt-dlp
                 search_term = original_user_input
                 
                 await send_progress_message(query.message, f"Buscando por: {original_user_input}...")
                 
-                # yt-dlp é inteligente o suficiente para encontrar o melhor resultado e os postprocessors cuidam da extração de áudio
                 search_results = ydl.extract_info(f"ytsearch1:{search_term}", download=False)
                 
                 if not search_results or "entries" not in search_results or not search_results["entries"]:
@@ -146,9 +170,7 @@ async def button_callback_handler(update: Update, context) -> None:
 
             file_path = ydl.prepare_filename(info)
             
-            # Ajustar o caminho do arquivo se for áudio e a extensão não for .mp3
             if download_type == "download_audio" and not file_path.endswith(".mp3"):
-                # Verificar se o arquivo .mp3 foi criado pelo postprocessor
                 mp3_path = os.path.splitext(file_path)[0] + ".mp3"
                 if os.path.exists(mp3_path):
                     file_path = mp3_path
