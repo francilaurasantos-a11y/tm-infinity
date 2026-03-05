@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+import requests # Importar a biblioteca requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 from yt_dlp import YoutubeDL
@@ -25,7 +26,6 @@ async def start(update: Update, context) -> None:
     await update.message.reply_text("Olá! Eu sou o bot TM-Infinity. Envie-me um link de vídeo/música ou o nome para baixar.")
 
 # Função auxiliar para enviar mensagens de progresso
-# Agora aceita um objeto message diretamente para maior flexibilidade
 async def send_progress_message(message_object, text: str):
     await message_object.reply_text(text)
 
@@ -39,6 +39,11 @@ async def handle_user_input(update: Update, context) -> None:
         [InlineKeyboardButton("Baixar como Vídeo (MP4)", callback_data="download_video")],
         [InlineKeyboardButton("Baixar como Música (MP3)", callback_data="download_audio")],
     ]
+    
+    # Adicionar botão para baixar arquivo genérico APENAS se for uma URL
+    if re.match(r"https?://[^\s]+\.\S+", user_input):
+        keyboard.append([InlineKeyboardButton("Baixar como Arquivo/APK", callback_data="download_file")])
+
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text("O que você gostaria de baixar?", reply_markup=reply_markup)
@@ -46,48 +51,90 @@ async def handle_user_input(update: Update, context) -> None:
 # Função para lidar com a escolha do botão (callback)
 async def button_callback_handler(update: Update, context) -> None:
     query = update.callback_query
-    await query.answer() # Responder ao callback para remover o estado de 'carregando' do botão
+    await query.answer() # Responder ao callback para remover o estado de \'carregando\' do botão
 
-    user_input = context.user_data.get("user_input")
+    original_user_input = context.user_data.get("user_input") # Usar a entrada original para exibição
     original_message = context.user_data.get("original_message")
 
-    if not user_input or not original_message:
+    if not original_user_input or not original_message:
         await query.edit_message_text("Desculpe, não consegui recuperar sua última solicitação. Por favor, envie novamente.")
         return
 
-    download_as_audio = query.data == "download_audio"
+    download_type = query.data
 
-    # Usar query.message para responder ao usuário após a escolha do botão
-    await query.edit_message_text(f"Recebido: {user_input}. Processando como {"Música" if download_as_audio else "Vídeo"}...")
+    await query.edit_message_text(f"Recebido: {original_user_input}. Processando como {download_type.replace("download_", "").replace("_", " ").upper()}...")
 
-    is_url = re.match(r"https?://[^\s]+\.\S+", user_input)
+    is_url = re.match(r"https?://[^\s]+\.\S+", original_user_input)
 
+    if download_type == "download_file":
+        if not is_url:
+            await send_progress_message(query.message, "Para baixar como arquivo, por favor, forneça um link direto.")
+            return
+        
+        try:
+            await send_progress_message(query.message, f"Baixando arquivo de: {original_user_input}...")
+            response = requests.get(original_user_input, stream=True)
+            response.raise_for_status() # Levanta um erro para códigos de status HTTP ruins
+
+            # Tentar obter o nome do arquivo do cabeçalho Content-Disposition ou da URL
+            filename = None
+            if "Content-Disposition" in response.headers:
+                fname_match = re.findall(r"filename=\"?([^\"]+)\"?", response.headers["Content-Disposition"])
+                if fname_match: filename = fname_match[0]
+            
+            if not filename:
+                filename = os.path.basename(original_user_input.split("?")[0])
+                if not filename or len(filename.split(".")) < 2: # Se não tiver nome ou extensão, usar um padrão
+                    filename = "downloaded_file.bin"
+
+            file_path = os.path.join(DOWNLOAD_DIR, filename)
+
+            with open(file_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            await send_progress_message(query.message, "Download concluído, enviando...")
+            
+            with open(file_path, "rb") as document:
+                await query.message.reply_document(document=document)
+            
+            os.remove(file_path)
+            logger.info(f"Arquivo {file_path} enviado e removido com sucesso.")
+
+        except Exception as e:
+            logger.error(f"Erro ao baixar arquivo: {e}", exc_info=True)
+            await send_progress_message(query.message, f"Ocorreu um erro ao baixar o arquivo: {e}")
+        return # Finaliza a função para download de arquivo
+
+    # Lógica existente para vídeo e áudio (yt-dlp)
     ydl_opts = {
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "noplaylist": True,
-        "progress_hooks": [lambda d: download_progress_hook(d, query.message)], # Passar query.message
+        "progress_hooks": [lambda d: download_progress_hook(d, query.message)],
         "restrictfilenames": True,
         "merge_output_format": "mp4",
     }
 
-    if download_as_audio:
+    if download_type == "download_audio":
         ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "192",
         }]
-        if not is_url:
-            user_input = f"ytsearch1:{user_input} audio"
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
             if is_url:
-                info = ydl.extract_info(user_input, download=True)
+                info = ydl.extract_info(original_user_input, download=True)
             else:
-                await send_progress_message(query.message, f"Buscando por: {user_input}...")
-                search_query = f"ytsearch1:{user_input}"
-                search_results = ydl.extract_info(search_query, download=False)
+                # CORREÇÃO: Apenas passa o termo de busca original para yt-dlp
+                search_term = original_user_input
+                
+                await send_progress_message(query.message, f"Buscando por: {original_user_input}...")
+                
+                # yt-dlp é inteligente o suficiente para encontrar o melhor resultado e os postprocessors cuidam da extração de áudio
+                search_results = ydl.extract_info(f"ytsearch1:{search_term}", download=False)
                 
                 if not search_results or "entries" not in search_results or not search_results["entries"]:
                     await send_progress_message(query.message, "Nenhum resultado encontrado para sua busca.")
@@ -99,13 +146,17 @@ async def button_callback_handler(update: Update, context) -> None:
 
             file_path = ydl.prepare_filename(info)
             
-            if download_as_audio and not file_path.endswith(".mp3") and os.path.exists(file_path.rsplit(".", 1)[0] + ".mp3"):
-                file_path = file_path.rsplit(".", 1)[0] + ".mp3"
+            # Ajustar o caminho do arquivo se for áudio e a extensão não for .mp3
+            if download_type == "download_audio" and not file_path.endswith(".mp3"):
+                # Verificar se o arquivo .mp3 foi criado pelo postprocessor
+                mp3_path = os.path.splitext(file_path)[0] + ".mp3"
+                if os.path.exists(mp3_path):
+                    file_path = mp3_path
 
             await send_progress_message(query.message, "Download concluído, enviando...")
             
             with open(file_path, "rb") as document:
-                await query.message.reply_document(document=document) # Usar query.message para enviar o documento
+                await query.message.reply_document(document=document)
             
             os.remove(file_path)
             logger.info(f"Arquivo {file_path} enviado e removido com sucesso.")
@@ -114,7 +165,6 @@ async def button_callback_handler(update: Update, context) -> None:
         logger.error(f"Erro ao baixar mídia: {e}", exc_info=True)
         await send_progress_message(query.message, f"Ocorreu um erro ao baixar a mídia: {e}")
 
-# A função download_progress_hook agora recebe o objeto message correto
 def download_progress_hook(d, message_object):
     if d["status"] == "finished":
         pass
