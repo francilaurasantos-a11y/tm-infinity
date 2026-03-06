@@ -91,7 +91,7 @@ async def process_playlist(query, playlist_url, context):
     }
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         with YoutubeDL(ydl_opts_playlist_info) as ydl:
             info_dict = await loop.run_in_executor(None, lambda: ydl.extract_info(playlist_url, download=False))
 
@@ -132,7 +132,7 @@ async def process_playlist(query, playlist_url, context):
                         }],
                         "restrictfilenames": True,
                         "merge_output_format": "mp3",
-                        "progress_hooks": [lambda d, msg=progress_msg, loop=context.application.loop: download_progress_hook(d, msg, loop)],
+                        "progress_hooks": [lambda d, msg=progress_msg, loop=loop: download_progress_hook(d, msg, loop)],
                         "quiet": True,
                         "no_warnings": True,
                         "external_downloader": "aria2c", 
@@ -177,7 +177,7 @@ async def process_playlist(query, playlist_url, context):
 async def process_single_item(query, user_input, download_type, context):
     is_url = re.match(r"https?://[^\s]+\.\S+", user_input)
     progress_msg = await query.message.reply_text(f"Iniciando...\n{create_progress_bar(0)}")
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     ydl_opts = {
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
