@@ -4,7 +4,8 @@ import re
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
-from yt_dlp import YoutubeDL, DownloadError, ExtractorError
+from yt_dlp import YoutubeDL, DownloadError
+from yt_dlp.utils import ExtractorError # Importação corrigida para ExtractorError
 
 # Configurar logging
 logging.basicConfig(
@@ -234,7 +235,7 @@ def download_progress_hook(d, message_object, loop):
         total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate")
         if total_bytes:
             progress = d["downloaded_bytes"] / total_bytes
-            status_text = f"Baixando: {create_progress_bar(progress)} | {d.get("_speed_str", "N/A")} | {d.get("_eta_str", "N/A")}"
+            status_text = f"Baixando: {create_progress_bar(progress)} | {d.get('_speed_str', 'N/A')} | {d.get('_eta_str', 'N/A')}"
             
             async def edit_message_async():
                 try: await message_object.edit_text(status_text)
