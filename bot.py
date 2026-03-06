@@ -4,7 +4,7 @@ import re
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
-from yt_dlp import YoutubeDL
+from yt_dlp import YoutubeDL, DownloadError, ExtractorError
 
 # Configurar logging
 logging.basicConfig(
@@ -75,8 +75,6 @@ async def run_download(query, user_input, download_type, context):
 async def process_playlist(query, playlist_url, context):
     initial_msg = await query.message.reply_text("Extraindo informações da playlist... Isso pode levar um tempo.")
     
-    # Usar extract_flat=\'in_playlist\' para obter IDs e URLs básicas rapidamente
-    # Isso é crucial para Spotify para evitar o bloqueio inicial
     ydl_opts_playlist_info = {
         "quiet": True,
         "no_warnings": True,
@@ -87,12 +85,14 @@ async def process_playlist(query, playlist_url, context):
                 "api_client_id": None, 
                 "api_client_secret": None,
             }
-        }
+        },
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"), # Necessário para yt-dlp
     }
 
     try:
         loop = asyncio.get_event_loop()
-        info_dict = await loop.run_in_executor(None, lambda: YoutubeDL(ydl_opts_playlist_info).extract_info(playlist_url, download=False))
+        with YoutubeDL(ydl_opts_playlist_info) as ydl:
+            info_dict = await loop.run_in_executor(None, lambda: ydl.extract_info(playlist_url, download=False))
 
         entries = info_dict.get("entries", [])
         if not entries:
@@ -107,11 +107,9 @@ async def process_playlist(query, playlist_url, context):
                 try:
                     track_id = entry.get("id")
                     track_title = entry.get("title", f"Faixa {i+1}")
-                    # Para Spotify, o \'url\' do entry pode ser um URI spotify:track:ID, precisamos converter
                     track_url = entry.get("url") or entry.get("webpage_url")
 
                     if "spotify" in playlist_url and track_id:
-                        # Construir a URL HTTP para o yt-dlp para cada faixa do Spotify
                         track_url = f"https://open.spotify.com/track/{track_id}"
                     
                     if not track_url:
@@ -136,11 +134,13 @@ async def process_playlist(query, playlist_url, context):
                         "progress_hooks": [lambda d, msg=progress_msg, loop=context.application.loop: download_progress_hook(d, msg, loop)],
                         "quiet": True,
                         "no_warnings": True,
+                        "external_downloader": "aria2c", 
+                        "external_downloader_args": ["-x16", "-k1M"],
                     }
                     
-                    single_track_ydl = YoutubeDL(single_track_ydl_opts)
-                    single_track_info = await loop.run_in_executor(None, lambda: single_track_ydl.extract_info(track_url, download=True))
-                    file_path = single_track_ydl.prepare_filename(single_track_info)
+                    with YoutubeDL(single_track_ydl_opts) as single_track_ydl:
+                        single_track_info = await loop.run_in_executor(None, lambda: single_track_ydl.extract_info(track_url, download=True))
+                        file_path = single_track_ydl.prepare_filename(single_track_info)
                     
                     mp3_path = os.path.splitext(file_path)[0] + ".mp3"
                     if os.path.exists(mp3_path):
@@ -153,15 +153,25 @@ async def process_playlist(query, playlist_url, context):
                     os.remove(file_path) 
                     logger.info(f"Música {file_path} da playlist enviada e removida com sucesso.")
 
+                except (DownloadError, ExtractorError) as e_ydl:
+                    error_message = f"Erro do yt-dlp ao baixar {track_title}: {e_ydl}"
+                    logger.error(error_message, exc_info=True)
+                    await query.message.reply_text(error_message)
                 except Exception as e_track:
-                    logger.error(f"Erro ao baixar ou enviar música da playlist {track_title}: {e_track}", exc_info=True)
-                    await query.message.reply_text(f"Erro ao baixar {track_title}: {e_track}")
+                    error_message = f"Erro inesperado ao baixar ou enviar música da playlist {track_title}: {e_track}"
+                    logger.error(error_message, exc_info=True)
+                    await query.message.reply_text(error_message)
             
         await query.message.reply_text("Download da playlist concluído!")
 
+    except (DownloadError, ExtractorError) as e_ydl:
+        error_message = f"Erro do yt-dlp ao processar playlist: {e_ydl}"
+        logger.error(error_message, exc_info=True)
+        await initial_msg.edit_text(error_message)
     except Exception as e:
-        logger.error(f"Erro ao processar playlist: {e}", exc_info=True)
-        await initial_msg.edit_text(f"Ocorreu um erro ao processar a playlist: {e}")
+        error_message = f"Ocorreu um erro inesperado ao processar a playlist: {e}"
+        logger.error(error_message, exc_info=True)
+        await initial_msg.edit_text(error_message)
 
 async def process_single_item(query, user_input, download_type, context):
     is_url = re.match(r"https?://[^\s]+\.\S+", user_input)
@@ -173,6 +183,8 @@ async def process_single_item(query, user_input, download_type, context):
         "noplaylist": True,
         "restrictfilenames": True,
         "progress_hooks": [lambda d, msg=progress_msg, loop=loop: download_progress_hook(d, msg, loop)],
+        "external_downloader": "aria2c", 
+        "external_downloader_args": ["-x16", "-k1M"],
     }
 
     if download_type == "download_audio":
@@ -208,9 +220,14 @@ async def process_single_item(query, user_input, download_type, context):
             else:
                 await progress_msg.edit_text("Falha ao encontrar o arquivo final.")
 
+    except (DownloadError, ExtractorError) as e_ydl:
+        error_message = f"Erro do yt-dlp ao baixar: {e_ydl}"
+        logger.error(error_message, exc_info=True)
+        await progress_msg.edit_text(error_message)
     except Exception as e:
-        logger.error(f"Erro ao baixar item único: {e}")
-        await progress_msg.edit_text(f"Ocorreu um erro: {e}")
+        error_message = f"Ocorreu um erro inesperado ao baixar: {e}"
+        logger.error(error_message, exc_info=True)
+        await progress_msg.edit_text(error_message)
 
 def download_progress_hook(d, message_object, loop):
     if d["status"] == "downloading":
