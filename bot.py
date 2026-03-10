@@ -3,9 +3,9 @@ import os
 import re
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from yt_dlp import YoutubeDL, DownloadError
-from yt_dlp.utils import ExtractorError # Importação corrigida para ExtractorError
+from yt_dlp.utils import ExtractorError
 
 # Configurar logging
 logging.basicConfig(
@@ -31,10 +31,15 @@ def create_progress_bar(progress: float, bar_length: int = 20) -> str:
 
 # --- Handlers do Telegram ---
 
-async def start(update: Update, context) -> None:
-    await update.message.reply_text("Olá! Eu sou o bot TM-Infinity. Envie-me um link de vídeo/música ou o nome para baixar.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Olá! Eu sou o bot TM-Infinity.\n\n"
+        "Envie-me um link de vídeo/música ou use o comando:\n"
+        "`/playlist nome da playlist` para buscar uma playlist pelo nome.",
+        parse_mode='Markdown'
+    )
 
-async def handle_user_input(update: Update, context) -> None:
+async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_input = update.message.text
     context.user_data["user_input"] = user_input
     context.user_data["original_message"] = update.message
@@ -50,16 +55,70 @@ async def handle_user_input(update: Update, context) -> None:
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("O que você gostaria de baixar?", reply_markup=reply_markup)
 
-async def button_callback_handler(update: Update, context) -> None:
+async def search_playlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Por favor, forneça o nome da playlist. Exemplo: `/playlist sertanejo 2024`", parse_mode='Markdown')
+        return
+    
+    query = " ".join(context.args)
+    msg = await update.message.reply_text(f"Buscando playlists para: {query}...")
+    
+    ydl_opts = {
+        "quiet": True,
+        "extract_flat": "in_playlist",
+    }
+    
+    try:
+        loop = asyncio.get_running_loop()
+        with YoutubeDL(ydl_opts) as ydl:
+            # Busca especificamente por playlists
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch5:playlist {query}", download=False))
+            entries = info.get("entries", [])
+            
+            if not entries:
+                await msg.edit_text("Nenhuma playlist encontrada para este nome.")
+                return
+            
+            keyboard = []
+            for i, entry in enumerate(entries):
+                title = entry.get("title", "Sem título")
+                url = entry.get("url") or entry.get("webpage_url")
+                # Armazenar a URL no callback_data (limite de 64 bytes)
+                # Se a URL for muito longa, usamos um índice e guardamos no user_data
+                context.user_data[f"pl_url_{i}"] = url
+                keyboard.append([InlineKeyboardButton(f"{title[:50]}", callback_data=f"select_pl_{i}")])
+            
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await msg.edit_text("Escolha uma playlist para baixar:", reply_markup=reply_markup)
+            
+    except Exception as e:
+        logger.error(f"Erro na busca de playlist: {e}", exc_info=True)
+        await msg.edit_text(f"Ocorreu um erro ao buscar playlists: {e}")
+
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
+
+    data = query.data
+    
+    # Se for seleção de playlist da busca
+    if data.startswith("select_pl_"):
+        index = data.replace("select_pl_", "")
+        playlist_url = context.user_data.get(f"pl_url_{index}")
+        if not playlist_url:
+            await query.edit_message_text("Erro ao recuperar a URL da playlist. Tente buscar novamente.")
+            return
+        
+        await query.edit_message_text(f"Playlist selecionada. Iniciando processamento...")
+        asyncio.create_task(process_playlist(query, playlist_url, context))
+        return
 
     user_input = context.user_data.get("user_input")
     if not user_input:
         await query.edit_message_text("Desculpe, não consegui recuperar sua solicitação. Por favor, envie novamente.")
         return
 
-    download_type = query.data
+    download_type = data
     await query.edit_message_text(f"Recebido: {user_input}. Processando como {download_type.replace('download_', '').replace('_', ' ').upper()}...")
 
     # Executa o download em uma nova tarefa para não bloquear o bot
@@ -80,14 +139,11 @@ async def process_playlist(query, playlist_url, context):
         "quiet": True,
         "no_warnings": True,
         "extract_flat": 'in_playlist', 
-        "force_generic_extractor": True, # Forçar extrator genérico para Spotify
-        "extractor_args": {
-            "spotify": {
-                "api_client_id": None, 
-                "api_client_secret": None,
-            }
-        },
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"), # Necessário para yt-dlp
+        "force_generic_extractor": True,
+        "retries": 20,
+        "fragment_retries": 20,
+        "socket_timeout": 120,
+        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
     }
 
     try:
@@ -97,28 +153,21 @@ async def process_playlist(query, playlist_url, context):
 
         entries = info_dict.get("entries", [])
         if not entries:
-            await initial_msg.edit_text("Não foi possível encontrar músicas na playlist ou a URL não é de uma playlist válida.")
+            await initial_msg.edit_text("Não foi possível encontrar músicas na playlist.")
             return
 
         total_tracks = len(entries)
-        await initial_msg.edit_text(f"Encontradas {total_tracks} músicas na playlist. Iniciando downloads...")
+        await initial_msg.edit_text(f"Encontradas {total_tracks} músicas. Iniciando downloads...")
 
         for i, entry in enumerate(entries):
             if entry:
                 try:
-                    track_id = entry.get("id")
                     track_title = entry.get("title", f"Faixa {i+1}")
                     track_url = entry.get("url") or entry.get("webpage_url")
-
-                    if "spotify" in playlist_url and track_id:
-                        track_url = f"https://open.spotify.com/track/{track_id}"
                     
-                    if not track_url:
-                        await query.message.reply_text(f"Não foi possível obter o link para a música {track_title}. Pulando.")
-                        logger.warning(f"Não foi possível obter o link para a música {track_title}. Pulando.")
-                        continue
+                    if not track_url: continue
 
-                    current_track_message_text = f"Baixando {i+1} de {total_tracks}: {track_title}...\n{create_progress_bar(0)}"
+                    current_track_message_text = f"Baixando {i+1} de {total_tracks}: {track_title}..."
                     progress_msg = await query.message.reply_text(current_track_message_text)
                     
                     single_track_ydl_opts = {
@@ -135,8 +184,9 @@ async def process_playlist(query, playlist_url, context):
                         "progress_hooks": [lambda d, msg=progress_msg, loop=loop: download_progress_hook(d, msg, loop)],
                         "quiet": True,
                         "no_warnings": True,
-                        "external_downloader": "aria2c", 
-                        "external_downloader_args": ["-x16", "-k1M"],
+                        "retries": 20,
+                        "fragment_retries": 20,
+                        "socket_timeout": 120,
                     }
                     
                     with YoutubeDL(single_track_ydl_opts) as single_track_ydl:
@@ -144,35 +194,26 @@ async def process_playlist(query, playlist_url, context):
                         file_path = single_track_ydl.prepare_filename(single_track_info)
                     
                     mp3_path = os.path.splitext(file_path)[0] + ".mp3"
-                    if os.path.exists(mp3_path):
-                        file_path = mp3_path
+                    if os.path.exists(mp3_path): file_path = mp3_path
 
-                    await progress_msg.edit_text(f"Enviando {i+1} de {total_tracks}: {track_title}...")
-                    with open(file_path, "rb") as document:
-                        await query.message.reply_document(document=document)
+                    file_size = os.path.getsize(file_path) / (1024 * 1024)
+                    if file_size > 50:
+                        await progress_msg.edit_text(f"⚠️ Arquivo muito grande ({file_size:.2f}MB). Limite 50MB.")
+                    else:
+                        await progress_msg.edit_text(f"Enviando {i+1} de {total_tracks}...")
+                        with open(file_path, "rb") as audio:
+                            await query.message.reply_audio(audio=audio, title=track_title)
                     
-                    os.remove(file_path) 
-                    logger.info(f"Música {file_path} da playlist enviada e removida com sucesso.")
+                    if os.path.exists(file_path): os.remove(file_path)
 
-                except (DownloadError, ExtractorError) as e_ydl:
-                    error_message = f"Erro do yt-dlp ao baixar {track_title}: {e_ydl}"
-                    logger.error(error_message, exc_info=True)
-                    await query.message.reply_text(error_message)
                 except Exception as e_track:
-                    error_message = f"Erro inesperado ao baixar ou enviar música da playlist {track_title}: {e_track}"
-                    logger.error(error_message, exc_info=True)
-                    await query.message.reply_text(error_message)
+                    logger.error(f"Erro na música {i+1}: {e_track}")
             
         await query.message.reply_text("Download da playlist concluído!")
 
-    except (DownloadError, ExtractorError) as e_ydl:
-        error_message = f"Erro do yt-dlp ao processar playlist: {e_ydl}"
-        logger.error(error_message, exc_info=True)
-        await initial_msg.edit_text(error_message)
     except Exception as e:
-        error_message = f"Ocorreu um erro inesperado ao processar a playlist: {e}"
-        logger.error(error_message, exc_info=True)
-        await initial_msg.edit_text(error_message)
+        logger.error(f"Erro na playlist: {e}", exc_info=True)
+        await initial_msg.edit_text(f"Erro ao processar playlist: {e}")
 
 async def process_single_item(query, user_input, download_type, context):
     is_url = re.match(r"https?://[^\s]+\.\S+", user_input)
@@ -183,9 +224,10 @@ async def process_single_item(query, user_input, download_type, context):
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "noplaylist": True,
         "restrictfilenames": True,
+        "retries": 20,
+        "fragment_retries": 20,
+        "socket_timeout": 120,
         "progress_hooks": [lambda d, msg=progress_msg, loop=loop: download_progress_hook(d, msg, loop)],
-        "external_downloader": "aria2c", 
-        "external_downloader_args": ["-x16", "-k1M"],
     }
 
     if download_type == "download_audio":
@@ -204,7 +246,7 @@ async def process_single_item(query, user_input, download_type, context):
                     await progress_msg.edit_text("Nenhum resultado encontrado.")
                     return
                 user_input = search_results["entries"][0]["webpage_url"]
-                await progress_msg.edit_text(f"Encontrado: {search_results["entries"][0]["title"]}. Baixando...")
+                await progress_msg.edit_text(f"Encontrado: {search_results['entries'][0]['title']}. Baixando...")
 
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(user_input, download=True))
             file_path = ydl.prepare_filename(info)
@@ -214,38 +256,37 @@ async def process_single_item(query, user_input, download_type, context):
                 final_path = os.path.splitext(file_path)[0] + ".mp3"
 
             if os.path.exists(final_path):
-                await progress_msg.edit_text("Enviando...")
-                with open(final_path, "rb") as document:
-                    await query.message.reply_document(document=document)
-                os.remove(final_path)
+                file_size = os.path.getsize(final_path) / (1024 * 1024)
+                if file_size > 50:
+                    await progress_msg.edit_text(f"⚠️ O arquivo ({file_size:.2f}MB) excede o limite de 50MB.")
+                else:
+                    await progress_msg.edit_text("Enviando...")
+                    with open(final_path, "rb") as doc:
+                        await query.message.reply_document(document=doc)
+                if os.path.exists(final_path): os.remove(final_path)
             else:
                 await progress_msg.edit_text("Falha ao encontrar o arquivo final.")
 
-    except (DownloadError, ExtractorError) as e_ydl:
-        error_message = f"Erro do yt-dlp ao baixar: {e_ydl}"
-        logger.error(error_message, exc_info=True)
-        await progress_msg.edit_text(error_message)
     except Exception as e:
-        error_message = f"Ocorreu um erro inesperado ao baixar: {e}"
-        logger.error(error_message, exc_info=True)
-        await progress_msg.edit_text(error_message)
+        logger.error(f"Erro no download: {e}", exc_info=True)
+        await progress_msg.edit_text(f"Erro: {e}")
 
 def download_progress_hook(d, message_object, loop):
     if d["status"] == "downloading":
         total_bytes = d.get("total_bytes") or d.get("total_bytes_estimate")
         if total_bytes:
             progress = d["downloaded_bytes"] / total_bytes
-            status_text = f"Baixando: {create_progress_bar(progress)} | {d.get('_speed_str', 'N/A')} | {d.get('_eta_str', 'N/A')}"
+            status_text = f"Baixando: {create_progress_bar(progress)} | {d.get('_speed_str', 'N/A')}"
             
             async def edit_message_async():
                 try: await message_object.edit_text(status_text)
-                except Exception: pass # Ignorar erros se a mensagem não puder ser editada
+                except Exception: pass
             
             asyncio.run_coroutine_threadsafe(edit_message_async(), loop)
 
     elif d["status"] == "finished":
         async def edit_message_async():
-            try: await message_object.edit_text("Download concluído. Processando e convertendo...")
+            try: await message_object.edit_text("Download concluído. Processando...")
             except Exception: pass
         
         asyncio.run_coroutine_threadsafe(edit_message_async(), loop)
@@ -255,11 +296,12 @@ def download_progress_hook(d, message_object, loop):
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("playlist", search_playlist_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_input))
     application.add_handler(CallbackQueryHandler(button_callback_handler))
 
     logger.info("Bot TM-Infinity iniciado...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
