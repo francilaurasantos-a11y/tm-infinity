@@ -65,29 +65,39 @@ async def search_playlist_command(update: Update, context: ContextTypes.DEFAULT_
     
     ydl_opts = {
         "quiet": True,
-        "extract_flat": "in_playlist",
+        "extract_flat": True,
+        "force_generic_extractor": False,
     }
     
     try:
         loop = asyncio.get_running_loop()
         with YoutubeDL(ydl_opts) as ydl:
-            # Busca especificamente por playlists
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(f"ytsearch5:playlist {query}", download=False))
-            entries = info.get("entries", [])
+            # Busca especificamente por playlists no YouTube
+            search_query = f"ytsearch5:playlist {query}"
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False))
             
-            if not entries:
+            # O yt-dlp retorna uma lista de resultados dentro de 'entries'
+            results = info.get("entries", [])
+            
+            if not results:
                 await msg.edit_text("Nenhuma playlist encontrada para este nome.")
                 return
             
             keyboard = []
-            for i, entry in enumerate(entries):
+            for i, entry in enumerate(results):
                 title = entry.get("title", "Sem título")
                 url = entry.get("url") or entry.get("webpage_url")
-                # Armazenar a URL no callback_data (limite de 64 bytes)
-                # Se a URL for muito longa, usamos um índice e guardamos no user_data
+                
+                if not url: continue
+                
+                # Armazenar a URL no user_data para o callback
                 context.user_data[f"pl_url_{i}"] = url
                 keyboard.append([InlineKeyboardButton(f"{title[:50]}", callback_data=f"select_pl_{i}")])
             
+            if not keyboard:
+                await msg.edit_text("Não foi possível extrair links das playlists encontradas.")
+                return
+
             reply_markup = InlineKeyboardMarkup(keyboard)
             await msg.edit_text("Escolha uma playlist para baixar:", reply_markup=reply_markup)
             
@@ -148,12 +158,21 @@ async def process_playlist(query, playlist_url, context):
 
     try:
         loop = asyncio.get_running_loop()
+        # Removendo extract_flat para garantir que as entradas da playlist sejam carregadas completamente
+        ydl_opts_playlist_info["extract_flat"] = False 
+        
         with YoutubeDL(ydl_opts_playlist_info) as ydl:
             info_dict = await loop.run_in_executor(None, lambda: ydl.extract_info(playlist_url, download=False))
 
+        # Algumas playlists podem vir aninhadas ou com formatos diferentes
         entries = info_dict.get("entries", [])
+        
+        # Tentar extrair de novo se for uma playlist de busca ou algo similar
+        if entries and len(entries) > 0 and 'entries' in entries[0]:
+            entries = entries[0]['entries']
+
         if not entries:
-            await initial_msg.edit_text("Não foi possível encontrar músicas na playlist.")
+            await initial_msg.edit_text("Não foi possível encontrar músicas na playlist ou a URL é inválida.")
             return
 
         total_tracks = len(entries)
