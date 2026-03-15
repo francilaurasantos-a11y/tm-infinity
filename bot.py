@@ -5,7 +5,6 @@ import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from yt_dlp import YoutubeDL
-import google.generativeai as genai
 
 # Configurar logging
 logging.basicConfig(
@@ -16,11 +15,6 @@ logger = logging.getLogger(__name__)
 
 # --- CONFIGURAÇÕES ---
 TOKEN = "8522636592:AAGGKm59cxMC5PYyjr3Dil1PZRG21C47a0g"
-GEMINI_API_KEY = "AIzaSyD3Em0Q3YoFqSiBSiqD3_yLNaYQI6dTJ_c"
-
-# Configurar Gemini AI
-genai.configure(api_key=GEMINI_API_KEY)
-chat_model = genai.GenerativeModel("gemini-pro")
 
 # Diretório de downloads
 DOWNLOAD_DIR = "downloads"
@@ -38,10 +32,9 @@ def create_progress_bar(progress: float, bar_length: int = 20) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Olá! Eu sou o bot TM-Infinity, agora com **Gemini AI**! 🤖✨\n\n"
-        "💬 **Chat Inteligente:** Basta me enviar uma pergunta ou mensagem!\n"
-        "🎵 **Música/Vídeo:** Envie um link do YouTube para baixar.\n"
-        "As músicas vêm com a capa do álbum!",
+        "Olá! Eu sou o bot TM-Infinity. 🎵🎥\n\n"
+        "Envie-me um link do YouTube para baixar músicas ou vídeos.\n"
+        "As músicas vêm com a capa do álbum e nome correto!",
         parse_mode='Markdown'
     )
 
@@ -61,16 +54,9 @@ async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text("O que você gostaria de fazer com este link?", reply_markup=reply_markup)
     
-    # Se for apenas texto (Chat com Gemini)
+    # Se for apenas texto (Apenas ignora ou avisa que precisa de link)
     else:
-        try:
-            # Mostra que o bot está "digitando"
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-            response = await asyncio.to_thread(chat_model.generate_content, user_input)
-            await update.message.reply_text(response.text, parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Erro no Gemini Chat: {e}")
-            await update.message.reply_text("🤖 Tive um pequeno erro ao processar sua mensagem. Verifique se a biblioteca 'google-generativeai' está instalada.")
+        await update.message.reply_text("Por favor, envie um link do YouTube para começar o download.")
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -79,7 +65,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     user_input = context.user_data.get("user_input")
     
     if not user_input:
-        await query.edit_message_text("Erro ao recuperar o link.")
+        await query.edit_message_text("Erro ao recuperar o link. Por favor, envie o link novamente.")
         return
 
     await query.edit_message_text(f"Processando download...")
@@ -159,7 +145,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_input))
     application.add_handler(CallbackQueryHandler(button_callback_handler))
 
-    logger.info("Bot TM-Infinity iniciado...")
+    logger.info("Bot TM-Infinity focado em downloads iniciado...")
     application.run_polling()
 
 if __name__ == "__main__":
