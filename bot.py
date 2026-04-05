@@ -35,10 +35,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Olá! Eu sou o bot TM-Infinity. 🎵🎥🎬\n\n"
         "Envie-me o **nome da música** ou um **link** para baixar!\n\n"
         "✅ **Suporte para:**\n"
-        "- YouTube (Música, Vídeo e Playlists)\n"
-        "- Instagram (Reels e Vídeos)\n"
+        "- YouTube (Música MP3)\n"
+        "- Instagram (Vídeos)\n"
         "- TikTok (Vídeos)\n\n"
-        "As músicas vêm com a capa do álbum e nome correto!",
+        "As músicas vêm com a capa do álbum e nome correto!\n\n"
+        "📱 Desenvolvido por: **Thiago Santos**",
         parse_mode='Markdown'
     )
 
@@ -47,22 +48,27 @@ async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data["user_input"] = user_input
     
     # Detectar se é link do Instagram ou TikTok
-    is_social = any(x in user_input.lower() for x in ["instagram.com", "tiktok.com"])
+    is_instagram = "instagram.com" in user_input.lower()
+    is_tiktok = "tiktok.com" in user_input.lower()
+    is_social = is_instagram or is_tiktok
     
-    keyboard = []
     if is_social:
-        keyboard.append([InlineKeyboardButton("Baixar Vídeo", callback_data="download_video")])
+        # Para Instagram/TikTok, baixa vídeo automaticamente
+        await update.message.reply_text("Iniciando download do vídeo...")
+        asyncio.create_task(run_download(update.message, user_input, "download_video", context))
     else:
         # Se for um link de playlist do YouTube
         if "list=" in user_input.lower() or "playlist" in user_input.lower():
-            keyboard.append([InlineKeyboardButton("Baixar Playlist (Áudio)", callback_data="download_playlist_audio")])
-            keyboard.append([InlineKeyboardButton("Baixar Playlist (Vídeo)", callback_data="download_playlist_video")])
+            keyboard = [
+                [InlineKeyboardButton("Baixar Playlist (Áudio MP3)", callback_data="download_playlist_audio")],
+                [InlineKeyboardButton("Baixar Playlist (Vídeo MP4)", callback_data="download_playlist_video")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(f"Como deseja baixar a playlist?", reply_markup=reply_markup)
         else:
-            keyboard.append([InlineKeyboardButton("Baixar como Música (MP3)", callback_data="download_audio")])
-            keyboard.append([InlineKeyboardButton("Baixar como Vídeo (MP4)", callback_data="download_video")])
-        
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"O que você deseja baixar?", reply_markup=reply_markup)
+            # Para buscas e links individuais do YouTube, baixa MP3 automaticamente
+            await update.message.reply_text("Iniciando download da música em MP3...")
+            asyncio.create_task(run_download(update.message, user_input, "download_audio", context))
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -74,20 +80,24 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Erro ao recuperar a solicitação. Envie o nome ou link novamente.")
         return
 
-    await query.edit_message_text(f"Iniciando processamento...")
+    await query.edit_message_text(f"Processando...")
     asyncio.create_task(run_download(query, user_input, data, context))
 
 # --- Lógica de Download ---
 
-async def run_download(query, user_input, download_type, context):
+async def run_download(query_or_msg, user_input, download_type, context):
+    # Detecta se é um CallbackQuery ou um Message normal
+    is_callback = hasattr(query_or_msg, 'message')
+    target_msg = query_or_msg.message if is_callback else query_or_msg
+
     if download_type.startswith("download_playlist"):
         media_type = "download_audio" if "audio" in download_type else "download_video"
-        await process_playlist(query, user_input, media_type, context)
+        await process_playlist(target_msg, user_input, media_type, context)
     else:
-        await process_single_item(query, user_input, download_type, context)
+        await process_single_item(target_msg, user_input, download_type, context)
 
-async def process_playlist(query, playlist_url, media_type, context):
-    initial_msg = await query.message.reply_text("Extraindo itens da playlist...")
+async def process_playlist(message, playlist_url, media_type, context):
+    initial_msg = await message.reply_text("Extraindo itens da playlist...")
     ydl_opts = {"quiet": True, "extract_flat": True}
     try:
         loop = asyncio.get_running_loop()
@@ -109,18 +119,17 @@ async def process_playlist(query, playlist_url, media_type, context):
                     url = f"https://www.youtube.com/watch?v={entry.get('id')}"
                 
                 if url:
-                    await process_single_item(query, url, media_type, context, is_playlist=True, index=i+1, total=total)
+                    await process_single_item(message, url, media_type, context, is_playlist=True, index=i+1, total=total)
         
-        await query.message.reply_text(f"✅ Download da playlist finalizado!")
+        await message.reply_text(f"✅ Download da playlist finalizado!")
     except Exception as e:
         logger.error(f"Erro na playlist: {e}")
         await initial_msg.edit_text(f"Erro ao processar playlist: {str(e)[:100]}...")
 
-async def process_single_item(query, input_data, download_type, context, is_playlist=False, index=0, total=0):
+async def process_single_item(message, input_data, download_type, context, is_playlist=False, index=0, total=0):
     loop = asyncio.get_running_loop()
     is_url = re.match(r"https?://", input_data)
     
-    # Opções base do yt-dlp
     ydl_opts = {
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "quiet": True,
@@ -153,13 +162,11 @@ async def process_single_item(query, input_data, download_type, context, is_play
     
     try:
         with YoutubeDL(ydl_opts) as ydl:
-            # Extrair informações primeiro para obter o título e garantir que existe resultado
             info_dict = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False))
             
             if not info_dict:
                 raise Exception("Nenhum resultado encontrado.")
 
-            # Se for busca, o resultado está em 'entries'
             if 'entries' in info_dict:
                 if not info_dict['entries']:
                     raise Exception("Busca não retornou resultados.")
@@ -167,7 +174,6 @@ async def process_single_item(query, input_data, download_type, context, is_play
             else:
                 info = info_dict
 
-            # Agora faz o download real
             await loop.run_in_executor(None, lambda: ydl.download([info['webpage_url'] if 'webpage_url' in info else search_query]))
             
             file_path = ydl.prepare_filename(info)
@@ -175,7 +181,6 @@ async def process_single_item(query, input_data, download_type, context, is_play
                 base, _ = os.path.splitext(file_path)
                 file_path = base + ".mp3"
             
-            # Verificação de segurança para extensões variadas
             if not os.path.exists(file_path):
                 base, _ = os.path.splitext(file_path)
                 for ext in ['.mp3', '.mp4', '.mkv', '.webm', '.m4a']:
@@ -189,9 +194,9 @@ async def process_single_item(query, input_data, download_type, context, is_play
                 
                 with open(file_path, "rb") as f:
                     if download_type == "download_audio" and file_path.endswith(".mp3"):
-                        await query.message.reply_audio(audio=f, title=title, caption=caption)
+                        await message.reply_audio(audio=f, title=title, caption=caption)
                     else:
-                        await query.message.reply_video(video=f, caption=caption)
+                        await message.reply_video(video=f, caption=caption)
                 
                 try:
                     os.remove(file_path)
@@ -202,12 +207,12 @@ async def process_single_item(query, input_data, download_type, context, is_play
                     pass
             else:
                 if not is_playlist:
-                    await query.message.reply_text(f"Erro: O arquivo não foi gerado corretamente.")
+                    await message.reply_text(f"Erro: O arquivo não foi gerado corretamente.")
 
     except Exception as e:
         logger.error(f"Erro no item: {e}")
         if not is_playlist:
-            await query.message.reply_text(f"Desculpe, ocorreu um erro: {str(e)[:100]}")
+            await message.reply_text(f"Desculpe, ocorreu um erro: {str(e)[:100]}")
 
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
