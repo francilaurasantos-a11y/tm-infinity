@@ -3,7 +3,6 @@ import os
 import re
 import asyncio
 import time
-import threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from yt_dlp import YoutubeDL
@@ -66,6 +65,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_input = update.message.text
     context.user_data["user_input"] = user_input
+    context.user_data["original_message"] = update.message
     
     # Detectar se é link do Instagram ou TikTok
     is_instagram = "instagram.com" in user_input.lower()
@@ -104,6 +104,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     status_msg = await query.edit_message_text(f"⏳ Processando...")
     context.user_data["status_msg"] = status_msg
+    context.user_data["original_message"] = query.message
     asyncio.create_task(run_download(status_msg, user_input, data, context))
 
 # --- Lógica de Download ---
@@ -176,7 +177,6 @@ async def process_single_item(status_msg, input_data, download_type, context, is
 
     def progress_hook(d):
         """Hook para atualizar o progresso do download"""
-        # Usar thread-safe para comunicar com o loop async
         if d['status'] == 'downloading':
             downloaded = d.get('downloaded_bytes', 0)
             total_bytes = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
@@ -200,17 +200,22 @@ async def process_single_item(status_msg, input_data, download_type, context, is
                 if progress_data["is_playlist"]:
                     progress_text = f"📦 Item {progress_data['index']}/{progress_data['total']}\n\n" + progress_text
                 
-                # Agendar a atualização de forma thread-safe
-                asyncio.run_coroutine_threadsafe(
-                    status_msg.edit_text(progress_text),
-                    progress_data["loop"]
-                )
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        status_msg.edit_text(progress_text),
+                        progress_data["loop"]
+                    )
+                except Exception as e:
+                    logger.error(f"Erro ao atualizar progresso: {e}")
         
         elif d['status'] == 'finished':
-            asyncio.run_coroutine_threadsafe(
-                status_msg.edit_text("✅ Download concluído! Processando arquivo..."),
-                progress_data["loop"]
-            )
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    status_msg.edit_text("✅ Download concluído! Processando arquivo..."),
+                    progress_data["loop"]
+                )
+            except Exception as e:
+                logger.error(f"Erro ao finalizar progresso: {e}")
 
     if download_type == "download_audio":
         ydl_opts.update({
@@ -265,11 +270,16 @@ async def process_single_item(status_msg, input_data, download_type, context, is
                 
                 await status_msg.edit_text(f"📤 Enviando arquivo para o Telegram...")
                 
+                # Usar a mensagem original do usuário para responder
+                original_msg = context.user_data.get("original_message")
+                if original_msg is None:
+                    original_msg = status_msg.reply_to_message
+                
                 with open(file_path, "rb") as f:
                     if download_type == "download_audio" and file_path.endswith(".mp3"):
-                        await status_msg.reply_to_message.reply_audio(audio=f, title=title, caption=caption)
+                        await original_msg.reply_audio(audio=f, title=title, caption=caption)
                     else:
-                        await status_msg.reply_to_message.reply_video(video=f, caption=caption)
+                        await original_msg.reply_video(video=f, caption=caption)
                 
                 await status_msg.edit_text(f"✅ Arquivo enviado com sucesso!")
                 
