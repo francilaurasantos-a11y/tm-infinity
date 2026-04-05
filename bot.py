@@ -2,6 +2,7 @@ import logging
 import os
 import re
 import asyncio
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from yt_dlp import YoutubeDL
@@ -24,9 +25,27 @@ if not os.path.exists(DOWNLOAD_DIR):
 # --- Funções Auxiliares ---
 
 def create_progress_bar(progress: float, bar_length: int = 20) -> str:
+    """Cria uma barra de progresso visual"""
     filled_length = int(bar_length * progress)
     bar = '█' * filled_length + '░' * (bar_length - filled_length)
     return f"[{bar}] {progress:.1%}"
+
+def format_bytes(bytes_value):
+    """Converte bytes para formato legível (KB, MB, GB)"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if bytes_value < 1024.0:
+            return f"{bytes_value:.1f}{unit}"
+        bytes_value /= 1024.0
+    return f"{bytes_value:.1f}TB"
+
+def format_time(seconds):
+    """Converte segundos para formato HH:MM:SS"""
+    if seconds is None or seconds == 0:
+        return "00:00:00"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 # --- Handlers do Telegram ---
 
@@ -54,8 +73,9 @@ async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     if is_social:
         # Para Instagram/TikTok, baixa vídeo automaticamente
-        await update.message.reply_text("Iniciando download do vídeo...")
-        asyncio.create_task(run_download(update.message, user_input, "download_video", context))
+        status_msg = await update.message.reply_text("⏳ Iniciando download do vídeo...")
+        context.user_data["status_msg"] = status_msg
+        asyncio.create_task(run_download(status_msg, user_input, "download_video", context))
     else:
         # Se for um link de playlist do YouTube
         if "list=" in user_input.lower() or "playlist" in user_input.lower():
@@ -67,8 +87,9 @@ async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text(f"Como deseja baixar a playlist?", reply_markup=reply_markup)
         else:
             # Para buscas e links individuais do YouTube, baixa MP3 automaticamente
-            await update.message.reply_text("Iniciando download da música em MP3...")
-            asyncio.create_task(run_download(update.message, user_input, "download_audio", context))
+            status_msg = await update.message.reply_text("⏳ Iniciando download da música em MP3...")
+            context.user_data["status_msg"] = status_msg
+            asyncio.create_task(run_download(status_msg, user_input, "download_audio", context))
 
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -80,37 +101,35 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("Erro ao recuperar a solicitação. Envie o nome ou link novamente.")
         return
 
-    await query.edit_message_text(f"Processando...")
-    asyncio.create_task(run_download(query, user_input, data, context))
+    status_msg = await query.edit_message_text(f"⏳ Processando...")
+    context.user_data["status_msg"] = status_msg
+    asyncio.create_task(run_download(status_msg, user_input, data, context))
 
 # --- Lógica de Download ---
 
-async def run_download(query_or_msg, user_input, download_type, context):
-    # Detecta se é um CallbackQuery ou um Message normal
-    is_callback = hasattr(query_or_msg, 'message')
-    target_msg = query_or_msg.message if is_callback else query_or_msg
-
+async def run_download(status_msg, user_input, download_type, context):
     if download_type.startswith("download_playlist"):
         media_type = "download_audio" if "audio" in download_type else "download_video"
-        await process_playlist(target_msg, user_input, media_type, context)
+        await process_playlist(status_msg, user_input, media_type, context)
     else:
-        await process_single_item(target_msg, user_input, download_type, context)
+        await process_single_item(status_msg, user_input, download_type, context)
 
-async def process_playlist(message, playlist_url, media_type, context):
-    initial_msg = await message.reply_text("Extraindo itens da playlist...")
-    ydl_opts = {"quiet": True, "extract_flat": True}
+async def process_playlist(status_msg, playlist_url, media_type, context):
     try:
+        await status_msg.edit_text("📋 Extraindo itens da playlist...")
+        ydl_opts = {"quiet": True, "extract_flat": True}
         loop = asyncio.get_running_loop()
+        
         with YoutubeDL(ydl_opts) as ydl:
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(playlist_url, download=False))
         
         entries = info.get('entries', [])
         if not entries:
-            await initial_msg.edit_text("Não foi possível encontrar itens nesta playlist.")
+            await status_msg.edit_text("❌ Não foi possível encontrar itens nesta playlist.")
             return
         
         total = len(entries)
-        await initial_msg.edit_text(f"Encontrados {total} itens. Iniciando downloads...")
+        await status_msg.edit_text(f"📦 Encontrados {total} itens. Iniciando downloads...")
         
         for i, entry in enumerate(entries):
             if entry:
@@ -119,14 +138,14 @@ async def process_playlist(message, playlist_url, media_type, context):
                     url = f"https://www.youtube.com/watch?v={entry.get('id')}"
                 
                 if url:
-                    await process_single_item(message, url, media_type, context, is_playlist=True, index=i+1, total=total)
+                    await process_single_item(status_msg, url, media_type, context, is_playlist=True, index=i+1, total=total)
         
-        await message.reply_text(f"✅ Download da playlist finalizado!")
+        await status_msg.edit_text(f"✅ Download da playlist finalizado!")
     except Exception as e:
         logger.error(f"Erro na playlist: {e}")
-        await initial_msg.edit_text(f"Erro ao processar playlist: {str(e)[:100]}...")
+        await status_msg.edit_text(f"❌ Erro ao processar playlist: {str(e)[:100]}...")
 
-async def process_single_item(message, input_data, download_type, context, is_playlist=False, index=0, total=0):
+async def process_single_item(status_msg, input_data, download_type, context, is_playlist=False, index=0, total=0):
     loop = asyncio.get_running_loop()
     is_url = re.match(r"https?://", input_data)
     
@@ -144,10 +163,24 @@ async def process_single_item(message, input_data, download_type, context, is_pl
     else:
         search_query = input_data
 
+    # Variáveis para rastrear progresso
+    progress_data = {
+        "last_update": time.time(),
+        "status_msg": status_msg,
+        "is_playlist": is_playlist,
+        "index": index,
+        "total": total
+    }
+
+    def progress_hook(d):
+        """Hook para atualizar o progresso do download"""
+        asyncio.create_task(update_progress(d, progress_data, download_type))
+
     if download_type == "download_audio":
         ydl_opts.update({
             "format": "bestaudio/best",
             "writethumbnail": True,
+            "progress_hooks": [progress_hook],
             "postprocessors": [
                 {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
                 {"key": "EmbedThumbnail"},
@@ -158,6 +191,7 @@ async def process_single_item(message, input_data, download_type, context, is_pl
         ydl_opts.update({
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
+            "progress_hooks": [progress_hook],
         })
     
     try:
@@ -190,13 +224,18 @@ async def process_single_item(message, input_data, download_type, context, is_pl
 
             if os.path.exists(file_path):
                 title = info.get('title', 'Arquivo')
-                caption = f"📦 Item {index}/{total}\n🎵 {title}" if is_playlist else f"✅ Aqui está: {title}"
+                file_size = os.path.getsize(file_path)
+                caption = f"📦 Item {index}/{total}\n🎵 {title}\n📊 Tamanho: {format_bytes(file_size)}" if is_playlist else f"✅ Aqui está: {title}\n📊 Tamanho: {format_bytes(file_size)}"
+                
+                await status_msg.edit_text(f"📤 Enviando arquivo para o Telegram...")
                 
                 with open(file_path, "rb") as f:
                     if download_type == "download_audio" and file_path.endswith(".mp3"):
-                        await message.reply_audio(audio=f, title=title, caption=caption)
+                        await status_msg.reply_to_message.reply_audio(audio=f, title=title, caption=caption)
                     else:
-                        await message.reply_video(video=f, caption=caption)
+                        await status_msg.reply_to_message.reply_video(video=f, caption=caption)
+                
+                await status_msg.edit_text(f"✅ Arquivo enviado com sucesso!")
                 
                 try:
                     os.remove(file_path)
@@ -207,12 +246,53 @@ async def process_single_item(message, input_data, download_type, context, is_pl
                     pass
             else:
                 if not is_playlist:
-                    await message.reply_text(f"Erro: O arquivo não foi gerado corretamente.")
+                    await status_msg.edit_text(f"❌ Erro: O arquivo não foi gerado corretamente.")
 
     except Exception as e:
         logger.error(f"Erro no item: {e}")
         if not is_playlist:
-            await message.reply_text(f"Desculpe, ocorreu um erro: {str(e)[:100]}")
+            await status_msg.edit_text(f"❌ Desculpe, ocorreu um erro: {str(e)[:100]}")
+
+async def update_progress(d, progress_data, download_type):
+    """Atualiza a mensagem de progresso em tempo real"""
+    current_time = time.time()
+    
+    # Atualiza apenas a cada 2 segundos para não sobrecarregar a API do Telegram
+    if current_time - progress_data["last_update"] < 2:
+        return
+    
+    progress_data["last_update"] = current_time
+    status_msg = progress_data["status_msg"]
+    
+    try:
+        if d['status'] == 'downloading':
+            downloaded = d.get('downloaded_bytes', 0)
+            total_bytes = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
+            speed = d.get('speed', 0)
+            eta = d.get('eta', 0)
+            
+            if total_bytes > 0:
+                progress = downloaded / total_bytes
+                bar = create_progress_bar(progress, 15)
+                
+                progress_text = (
+                    f"⬇️ Baixando...\n\n"
+                    f"{bar}\n"
+                    f"{format_bytes(downloaded)} / {format_bytes(total_bytes)}\n"
+                    f"🚀 Velocidade: {format_bytes(speed)}/s\n"
+                    f"⏱️ Tempo restante: {format_time(eta)}"
+                )
+                
+                if progress_data["is_playlist"]:
+                    progress_text = f"📦 Item {progress_data['index']}/{progress_data['total']}\n\n" + progress_text
+                
+                await status_msg.edit_text(progress_text)
+        
+        elif d['status'] == 'finished':
+            await status_msg.edit_text("✅ Download concluído! Processando arquivo...")
+    
+    except Exception as e:
+        logger.error(f"Erro ao atualizar progresso: {e}")
 
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
