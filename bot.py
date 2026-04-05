@@ -94,7 +94,6 @@ async def process_playlist(query, playlist_url, media_type, context):
         with YoutubeDL(ydl_opts) as ydl:
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(playlist_url, download=False))
         
-        # O yt-dlp pode retornar uma lista de entradas diretamente ou dentro de 'entries'
         entries = info.get('entries', [])
         if not entries:
             await initial_msg.edit_text("Não foi possível encontrar itens nesta playlist.")
@@ -105,7 +104,6 @@ async def process_playlist(query, playlist_url, media_type, context):
         
         for i, entry in enumerate(entries):
             if entry:
-                # O link pode estar em 'url' ou 'webpage_url'
                 url = entry.get('url') or entry.get('webpage_url')
                 if not url and entry.get('id'):
                     url = f"https://www.youtube.com/watch?v={entry.get('id')}"
@@ -129,15 +127,14 @@ async def process_single_item(query, input_data, download_type, context, is_play
         "noplaylist": True,
         "retries": 10,
         "socket_timeout": 30,
+        "ignoreerrors": True,
     }
 
-    # Se for busca por nome (YouTube)
     if not is_url:
         search_query = f"ytsearch1:{input_data}"
     else:
         search_query = input_data
 
-    # Configurações específicas por tipo
     if download_type == "download_audio":
         ydl_opts.update({
             "format": "bestaudio/best",
@@ -149,7 +146,6 @@ async def process_single_item(query, input_data, download_type, context, is_play
             ],
         })
     else:
-        # Para Vídeo
         ydl_opts.update({
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
@@ -157,22 +153,32 @@ async def process_single_item(query, input_data, download_type, context, is_play
     
     try:
         with YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=True))
+            # Extrair informações primeiro para obter o título e garantir que existe resultado
+            info_dict = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False))
             
-            # Se for busca, pega o primeiro resultado
-            if 'entries' in info and info['entries']:
-                info = info['entries'][0]
+            if not info_dict:
+                raise Exception("Nenhum resultado encontrado.")
+
+            # Se for busca, o resultado está em 'entries'
+            if 'entries' in info_dict:
+                if not info_dict['entries']:
+                    raise Exception("Busca não retornou resultados.")
+                info = info_dict['entries'][0]
+            else:
+                info = info_dict
+
+            # Agora faz o download real
+            await loop.run_in_executor(None, lambda: ydl.download([info['webpage_url'] if 'webpage_url' in info else search_query]))
             
             file_path = ydl.prepare_filename(info)
             if download_type == "download_audio":
-                # Garantir que a extensão seja .mp3 após o postprocessor
                 base, _ = os.path.splitext(file_path)
                 file_path = base + ".mp3"
             
             # Verificação de segurança para extensões variadas
             if not os.path.exists(file_path):
                 base, _ = os.path.splitext(file_path)
-                for ext in ['.mp3', '.mp4', '.mkv', '.webm']:
+                for ext in ['.mp3', '.mp4', '.mkv', '.webm', '.m4a']:
                     if os.path.exists(base + ext):
                         file_path = base + ext
                         break
@@ -187,27 +193,23 @@ async def process_single_item(query, input_data, download_type, context, is_play
                     else:
                         await query.message.reply_video(video=f, caption=caption)
                 
-                # Remover arquivo após envio
                 try:
                     os.remove(file_path)
-                    # Remover thumbnail se sobrar
-                    thumb = os.path.splitext(file_path)[0] + ".jpg"
-                    if os.path.exists(thumb): os.remove(thumb)
-                    thumb_webp = os.path.splitext(file_path)[0] + ".webp"
-                    if os.path.exists(thumb_webp): os.remove(thumb_webp)
+                    base_path = os.path.splitext(file_path)[0]
+                    for ext in ['.jpg', '.webp', '.png', '.temp']:
+                        if os.path.exists(base_path + ext): os.remove(base_path + ext)
                 except:
                     pass
             else:
                 if not is_playlist:
-                    await query.message.reply_text(f"Erro ao processar o arquivo: {info.get('title')}")
+                    await query.message.reply_text(f"Erro: O arquivo não foi gerado corretamente.")
 
     except Exception as e:
         logger.error(f"Erro no item: {e}")
         if not is_playlist:
-            await query.message.reply_text(f"Desculpe, não consegui baixar. Verifique o link ou tente novamente.")
+            await query.message.reply_text(f"Desculpe, ocorreu um erro: {str(e)[:100]}")
 
 def main() -> None:
-    # Nota: O token deve ser configurado via variável de ambiente para segurança em produção
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_input))
