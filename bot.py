@@ -35,7 +35,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Olá! Eu sou o bot TM-Infinity. 🎵🎥🎬\n\n"
         "Envie-me o **nome da música** ou um **link** para baixar!\n\n"
         "✅ **Suporte para:**\n"
-        "- YouTube (Música e Vídeo)\n"
+        "- YouTube (Música, Vídeo e Playlists)\n"
         "- Instagram (Reels e Vídeos)\n"
         "- TikTok (Vídeos)\n\n"
         "As músicas vêm com a capa do álbum e nome correto!",
@@ -53,13 +53,14 @@ async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if is_social:
         keyboard.append([InlineKeyboardButton("Baixar Vídeo", callback_data="download_video")])
     else:
-        keyboard.append([InlineKeyboardButton("Baixar como Música (MP3)", callback_data="download_audio")])
-        keyboard.append([InlineKeyboardButton("Baixar como Vídeo (MP4)", callback_data="download_video")])
-        
         # Se for um link de playlist do YouTube
         if "list=" in user_input.lower() or "playlist" in user_input.lower():
-            keyboard.append([InlineKeyboardButton("Baixar Playlist Completa", callback_data="download_playlist_audio")])
-    
+            keyboard.append([InlineKeyboardButton("Baixar Playlist (Áudio)", callback_data="download_playlist_audio")])
+            keyboard.append([InlineKeyboardButton("Baixar Playlist (Vídeo)", callback_data="download_playlist_video")])
+        else:
+            keyboard.append([InlineKeyboardButton("Baixar como Música (MP3)", callback_data="download_audio")])
+            keyboard.append([InlineKeyboardButton("Baixar como Vídeo (MP4)", callback_data="download_video")])
+        
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(f"O que você deseja baixar?", reply_markup=reply_markup)
 
@@ -79,31 +80,43 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 # --- Lógica de Download ---
 
 async def run_download(query, user_input, download_type, context):
-    if download_type == "download_playlist_audio":
-        await process_playlist(query, user_input, context)
+    if download_type.startswith("download_playlist"):
+        media_type = "download_audio" if "audio" in download_type else "download_video"
+        await process_playlist(query, user_input, media_type, context)
     else:
         await process_single_item(query, user_input, download_type, context)
 
-async def process_playlist(query, playlist_url, context):
-    initial_msg = await query.message.reply_text("Extraindo músicas da playlist...")
+async def process_playlist(query, playlist_url, media_type, context):
+    initial_msg = await query.message.reply_text("Extraindo itens da playlist...")
     ydl_opts = {"quiet": True, "extract_flat": True}
     try:
         loop = asyncio.get_running_loop()
         with YoutubeDL(ydl_opts) as ydl:
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(playlist_url, download=False))
+        
+        # O yt-dlp pode retornar uma lista de entradas diretamente ou dentro de 'entries'
         entries = info.get('entries', [])
         if not entries:
-            await initial_msg.edit_text("Não foi possível encontrar músicas nesta playlist.")
+            await initial_msg.edit_text("Não foi possível encontrar itens nesta playlist.")
             return
         
-        await initial_msg.edit_text(f"Encontradas {len(entries)} músicas. Baixando...")
+        total = len(entries)
+        await initial_msg.edit_text(f"Encontrados {total} itens. Iniciando downloads...")
+        
         for i, entry in enumerate(entries):
             if entry:
+                # O link pode estar em 'url' ou 'webpage_url'
                 url = entry.get('url') or entry.get('webpage_url')
+                if not url and entry.get('id'):
+                    url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                
                 if url:
-                    await process_single_item(query, url, "download_audio", context, is_playlist=True, index=i+1, total=len(entries))
+                    await process_single_item(query, url, media_type, context, is_playlist=True, index=i+1, total=total)
+        
+        await query.message.reply_text(f"✅ Download da playlist finalizado!")
     except Exception as e:
-        await initial_msg.edit_text(f"Erro na playlist: {e}")
+        logger.error(f"Erro na playlist: {e}")
+        await initial_msg.edit_text(f"Erro ao processar playlist: {str(e)[:100]}...")
 
 async def process_single_item(query, input_data, download_type, context, is_playlist=False, index=0, total=0):
     loop = asyncio.get_running_loop()
@@ -136,9 +149,9 @@ async def process_single_item(query, input_data, download_type, context, is_play
             ],
         })
     else:
-        # Para Instagram/TikTok, o formato mp4 geralmente é o padrão direto
+        # Para Vídeo
         ydl_opts.update({
-            "format": "bestvideo+bestaudio/best",
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
         })
     
@@ -147,27 +160,46 @@ async def process_single_item(query, input_data, download_type, context, is_play
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=True))
             
             # Se for busca, pega o primeiro resultado
-            if 'entries' in info:
+            if 'entries' in info and info['entries']:
                 info = info['entries'][0]
             
             file_path = ydl.prepare_filename(info)
             if download_type == "download_audio":
-                file_path = os.path.splitext(file_path)[0] + ".mp3"
+                # Garantir que a extensão seja .mp3 após o postprocessor
+                base, _ = os.path.splitext(file_path)
+                file_path = base + ".mp3"
             
-            # Para alguns casos onde o mp4 já é o final
-            if not os.path.exists(file_path) and os.path.exists(file_path.replace(".mp3", ".mp4")):
-                file_path = file_path.replace(".mp3", ".mp4")
+            # Verificação de segurança para extensões variadas
+            if not os.path.exists(file_path):
+                base, _ = os.path.splitext(file_path)
+                for ext in ['.mp3', '.mp4', '.mkv', '.webm']:
+                    if os.path.exists(base + ext):
+                        file_path = base + ext
+                        break
 
             if os.path.exists(file_path):
-                caption = f"Faixa {index}/{total}" if is_playlist else f"Aqui está: {info.get('title', 'Vídeo')}"
+                title = info.get('title', 'Arquivo')
+                caption = f"📦 Item {index}/{total}\n🎵 {title}" if is_playlist else f"✅ Aqui está: {title}"
+                
                 with open(file_path, "rb") as f:
                     if download_type == "download_audio" and file_path.endswith(".mp3"):
-                        await query.message.reply_audio(audio=f, title=info.get('title'), caption=caption)
+                        await query.message.reply_audio(audio=f, title=title, caption=caption)
                     else:
                         await query.message.reply_video(video=f, caption=caption)
-                os.remove(file_path)
+                
+                # Remover arquivo após envio
+                try:
+                    os.remove(file_path)
+                    # Remover thumbnail se sobrar
+                    thumb = os.path.splitext(file_path)[0] + ".jpg"
+                    if os.path.exists(thumb): os.remove(thumb)
+                    thumb_webp = os.path.splitext(file_path)[0] + ".webp"
+                    if os.path.exists(thumb_webp): os.remove(thumb_webp)
+                except:
+                    pass
             else:
-                await query.message.reply_text(f"Erro ao processar o arquivo.")
+                if not is_playlist:
+                    await query.message.reply_text(f"Erro ao processar o arquivo: {info.get('title')}")
 
     except Exception as e:
         logger.error(f"Erro no item: {e}")
@@ -175,12 +207,13 @@ async def process_single_item(query, input_data, download_type, context, is_play
             await query.message.reply_text(f"Desculpe, não consegui baixar. Verifique o link ou tente novamente.")
 
 def main() -> None:
+    # Nota: O token deve ser configurado via variável de ambiente para segurança em produção
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_input))
     application.add_handler(CallbackQueryHandler(button_callback_handler))
 
-    logger.info("Bot TM-Infinity com suporte Instagram/TikTok iniciado...")
+    logger.info("Bot TM-Infinity iniciado...")
     application.run_polling()
 
 if __name__ == "__main__":

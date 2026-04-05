@@ -6,6 +6,7 @@ Este robô do Telegram permite baixar vídeos e músicas de diversas plataformas
 
 - Download de vídeos por URL.
 - Download de músicas por URL.
+- Suporte a **Playlists do YouTube** (download completo em áudio ou vídeo).
 - Busca e download de vídeos por nome.
 - Busca e download de músicas por nome (extrai o áudio).
 - Suporte a diversas plataformas via `yt-dlp`.
@@ -123,6 +124,7 @@ Após iniciar o bot, envie um link de vídeo/música ou o nome do conteúdo que 
 
 **Exemplos:**
 - `https://www.youtube.com/watch?v=dQw4w9WgXcQ` (para baixar um vídeo)
+- `https://www.youtube.com/playlist?list=PL4fGSI1pDJn6jWjX6U2Nn_W8Lcfp08W_M` (para baixar uma playlist inteira)
 - `música despacito` (para buscar e baixar a música em MP3)
 - `vídeo gatos engraçados` (para buscar e baixar um vídeo)
 
