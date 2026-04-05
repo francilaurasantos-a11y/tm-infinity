@@ -3,6 +3,7 @@ import os
 import re
 import asyncio
 import time
+import threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from yt_dlp import YoutubeDL
@@ -169,12 +170,47 @@ async def process_single_item(status_msg, input_data, download_type, context, is
         "status_msg": status_msg,
         "is_playlist": is_playlist,
         "index": index,
-        "total": total
+        "total": total,
+        "loop": loop
     }
 
     def progress_hook(d):
         """Hook para atualizar o progresso do download"""
-        asyncio.create_task(update_progress(d, progress_data, download_type))
+        # Usar thread-safe para comunicar com o loop async
+        if d['status'] == 'downloading':
+            downloaded = d.get('downloaded_bytes', 0)
+            total_bytes = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
+            speed = d.get('speed', 0)
+            eta = d.get('eta', 0)
+            
+            current_time = time.time()
+            if current_time - progress_data["last_update"] >= 2 and total_bytes > 0:
+                progress_data["last_update"] = current_time
+                progress = downloaded / total_bytes
+                bar = create_progress_bar(progress, 15)
+                
+                progress_text = (
+                    f"⬇️ Baixando...\n\n"
+                    f"{bar}\n"
+                    f"{format_bytes(downloaded)} / {format_bytes(total_bytes)}\n"
+                    f"🚀 Velocidade: {format_bytes(speed)}/s\n"
+                    f"⏱️ Tempo restante: {format_time(eta)}"
+                )
+                
+                if progress_data["is_playlist"]:
+                    progress_text = f"📦 Item {progress_data['index']}/{progress_data['total']}\n\n" + progress_text
+                
+                # Agendar a atualização de forma thread-safe
+                asyncio.run_coroutine_threadsafe(
+                    status_msg.edit_text(progress_text),
+                    progress_data["loop"]
+                )
+        
+        elif d['status'] == 'finished':
+            asyncio.run_coroutine_threadsafe(
+                status_msg.edit_text("✅ Download concluído! Processando arquivo..."),
+                progress_data["loop"]
+            )
 
     if download_type == "download_audio":
         ydl_opts.update({
@@ -252,47 +288,6 @@ async def process_single_item(status_msg, input_data, download_type, context, is
         logger.error(f"Erro no item: {e}")
         if not is_playlist:
             await status_msg.edit_text(f"❌ Desculpe, ocorreu um erro: {str(e)[:100]}")
-
-async def update_progress(d, progress_data, download_type):
-    """Atualiza a mensagem de progresso em tempo real"""
-    current_time = time.time()
-    
-    # Atualiza apenas a cada 2 segundos para não sobrecarregar a API do Telegram
-    if current_time - progress_data["last_update"] < 2:
-        return
-    
-    progress_data["last_update"] = current_time
-    status_msg = progress_data["status_msg"]
-    
-    try:
-        if d['status'] == 'downloading':
-            downloaded = d.get('downloaded_bytes', 0)
-            total_bytes = d.get('total_bytes', 0) or d.get('total_bytes_estimate', 0)
-            speed = d.get('speed', 0)
-            eta = d.get('eta', 0)
-            
-            if total_bytes > 0:
-                progress = downloaded / total_bytes
-                bar = create_progress_bar(progress, 15)
-                
-                progress_text = (
-                    f"⬇️ Baixando...\n\n"
-                    f"{bar}\n"
-                    f"{format_bytes(downloaded)} / {format_bytes(total_bytes)}\n"
-                    f"🚀 Velocidade: {format_bytes(speed)}/s\n"
-                    f"⏱️ Tempo restante: {format_time(eta)}"
-                )
-                
-                if progress_data["is_playlist"]:
-                    progress_text = f"📦 Item {progress_data['index']}/{progress_data['total']}\n\n" + progress_text
-                
-                await status_msg.edit_text(progress_text)
-        
-        elif d['status'] == 'finished':
-            await status_msg.edit_text("✅ Download concluído! Processando arquivo...")
-    
-    except Exception as e:
-        logger.error(f"Erro ao atualizar progresso: {e}")
 
 def main() -> None:
     application = Application.builder().token(TOKEN).build()
