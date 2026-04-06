@@ -34,19 +34,18 @@ def create_progress_bar(progress: float, bar_length: int = 20) -> str:
 
 
 def notify_divulgacao(chat_id: int, file_id: str, song_name: str, file_size: int):
-    """Avisa o bot de divulgação que um novo MP3 está disponível."""
+    """Avisa o bot de divulgação via webhook local (porta 3333)."""
     try:
         requests.post(
-            f"https://api.telegram.org/bot{DIVULGACAO_TOKEN}/sendAudio",
+            "http://localhost:3333/nova-musica",
             json={
                 "chat_id": chat_id,
-                "audio": file_id,
-                "caption": f"🎵 {song_name}",
-                "parse_mode": "Markdown"
+                "file_id": file_id,
+                "song_name": song_name,
             },
             timeout=10
         )
-        logger.info(f"[DIVULGAÇÃO] Notificado: {song_name}")
+        logger.info(f"[DIVULGAÇÃO] Notificado via webhook: {song_name}")
     except Exception as e:
         logger.warning(f"[DIVULGAÇÃO] Falha ao notificar: {e}")
 
@@ -249,3 +248,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
