@@ -3,432 +3,172 @@ import os
 import re
 import asyncio
 import zipfile
+import shutil
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from yt_dlp import YoutubeDL
 import requests
 
+# Configurar logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# --- CONFIGURAÇÕES ---
 TOKEN = "8522636592:AAGGKm59cxMC5PYyjr3Dil1PZRG21C47a0g"
+
+# Token do bot de divulgação (Node.js) — notificado automaticamente após cada MP3
 DIVULGACAO_TOKEN = "8362410901:AAGMZ24BVZNpv4ttJeRpZ1qLonoS9tORPUU"
 
+# Diretório de downloads
 DOWNLOAD_DIR = "downloads"
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
 
-CATEGORIA_QUANTIDADE = 1000
-ZIP_PARTE_TAMANHO = 500
-ZIP_TAMANHO_MAX_BYTES = int(1.8 * 1024 * 1024 * 1024)
+# --- Funções Auxiliares ---
 
-
-def create_progress_bar(progress, bar_length=20):
+def create_progress_bar(progress: float, bar_length: int = 20) -> str:
     filled_length = int(bar_length * progress)
-    bar = '\u2588' * filled_length + '\u2591' * (bar_length - filled_length)
-    return "[{}] {:.1%}".format(bar, progress)
+    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+    return f"[{bar}] {progress:.1%}"
 
 
-def notify_divulgacao(chat_id, file_id, song_name, file_size):
+def notify_divulgacao(chat_id: int, file_id: str, song_name: str, file_size: int):
+    """Avisa o bot de divulgação via webhook local (porta 3333)."""
     try:
         requests.post(
             "http://localhost:3333/nova-musica",
-            json={"chat_id": chat_id, "file_id": file_id, "song_name": song_name},
+            json={
+                "chat_id": chat_id,
+                "file_id": file_id,
+                "song_name": song_name,
+            },
             timeout=10
         )
-        logger.info("[DIVULGACAO] Notificado: {}".format(song_name))
+        logger.info(f"[DIVULGAÇÃO] Notificado via webhook: {song_name}")
     except Exception as e:
-        logger.warning("[DIVULGACAO] Falha: {}".format(e))
+        logger.warning(f"[DIVULGAÇÃO] Falha ao notificar: {e}")
 
+# --- Handlers do Telegram ---
 
-def criar_zip(file_paths, zip_name):
-    zip_path = os.path.join(DOWNLOAD_DIR, zip_name)
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for file_path in file_paths:
-            if os.path.exists(file_path):
-                zipf.write(file_path, os.path.basename(file_path))
-    return zip_path
-
-
-def dividir_em_partes(file_paths):
-    partes = []
-    parte_atual = []
-    tamanho_atual = 0
-    for fp in file_paths:
-        if not os.path.exists(fp):
-            continue
-        tamanho_arquivo = os.path.getsize(fp)
-        excede_quantidade = len(parte_atual) >= ZIP_PARTE_TAMANHO
-        excede_tamanho = (tamanho_atual + tamanho_arquivo) > ZIP_TAMANHO_MAX_BYTES
-        if parte_atual and (excede_quantidade or excede_tamanho):
-            partes.append(parte_atual)
-            parte_atual = []
-            tamanho_atual = 0
-        parte_atual.append(fp)
-        tamanho_atual += tamanho_arquivo
-    if parte_atual:
-        partes.append(parte_atual)
-    return partes
-
-
-async def enviar_zips_divididos(message, status_msg, downloaded_files, base_nome, titulo, erros, loop):
-    partes = dividir_em_partes(downloaded_files)
-    total_partes = len(partes)
-
-    if total_partes == 0:
-        await status_msg.edit_text("\u274c Nenhum arquivo valido para compactar.")
-        return
-
-    await status_msg.edit_text(
-        "\U0001f4e6 {} ZIP(s) serao criados e enviados...\n\U0001f3b5 {} musicas no total".format(
-            total_partes, len(downloaded_files)
-        )
-    )
-
-    zips_criados = []
-
-    for i, parte in enumerate(partes, start=1):
-        if total_partes > 1:
-            parte_label = "_parte{}de{}".format(i, total_partes)
-        else:
-            parte_label = ""
-        zip_name = "{}{}.zip".format(base_nome, parte_label)
-
-        try:
-            await status_msg.edit_text(
-                "\U0001f4e6 Compactando parte {}/{}...\n\U0001f3b5 {} musicas nesta parte".format(
-                    i, total_partes, len(parte)
-                )
-            )
-        except Exception:
-            pass
-
-        zip_path = await loop.run_in_executor(None, lambda p=parte, n=zip_name: criar_zip(p, n))
-        zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
-        zips_criados.append(zip_path)
-
-        try:
-            await status_msg.edit_text(
-                "\U0001f4e4 Enviando ZIP {}/{} ({:.1f} MB)...".format(i, total_partes, zip_size_mb)
-            )
-        except Exception:
-            pass
-
-        if total_partes > 1:
-            erros_txt = "\u26a0\ufe0f {} erros ignorados".format(erros) if (erros and i == total_partes) else ""
-            caption = "\U0001f4e6 **{}** \u2014 Parte {} de {}\n\U0001f3b5 {} musicas\n{}".format(
-                titulo, i, total_partes, len(parte), erros_txt
-            )
-        else:
-            if erros:
-                ok_txt = "\u26a0\ufe0f {} erros ignorados".format(erros)
-            else:
-                ok_txt = "\u2705 Todos os downloads OK"
-            caption = "\U0001f4e6 **{} \u2014 Pacote Completo**\n\U0001f3b5 {} musicas\n{}".format(
-                titulo, len(parte), ok_txt
-            )
-
-        with open(zip_path, 'rb') as zf:
-            await message.reply_document(
-                document=zf,
-                filename=zip_name,
-                caption=caption,
-                parse_mode='Markdown'
-            )
-
-    if total_partes > 1:
-        erros_txt = "\u26a0\ufe0f {} erros ignorados".format(erros) if erros else ""
-        await message.reply_text(
-            "\u2705 **Concluido!**\n\U0001f4e6 {} ZIPs enviados\n\U0001f3b5 {} musicas no total\n{}".format(
-                total_partes, len(downloaded_files), erros_txt
-            ),
-            parse_mode='Markdown'
-        )
-
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
-
-    for fp in downloaded_files:
-        try:
-            os.remove(fp)
-            base = os.path.splitext(fp)[0]
-            for ext in ['.jpg', '.webp', '.png', '.temp']:
-                if os.path.exists(base + ext):
-                    os.remove(base + ext)
-        except Exception:
-            pass
-
-    for zp in zips_criados:
-        try:
-            os.remove(zp)
-        except Exception:
-            pass
-
-
-async def start(update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Ola! Eu sou o bot TM-Infinity. \U0001f3b5\U0001f3a5\U0001f3ac\n\n"
-        "Envie-me o **nome da musica** ou um **link** para baixar!\n\n"
-        "\u2705 **Suporte para:**\n"
-        "- YouTube (Musica, Video e Playlists)\n"
-        "- Instagram (Reels e Videos)\n"
-        "- TikTok (Videos)\n\n"
-        "\U0001f4e6 **Download em Massa por Categoria:**\n"
-        "Use `/categoria <genero>` para baixar musicas e receber ZIPs automaticos!\n"
-        "Exemplo: `/categoria funk`, `/categoria sertanejo`, `/categoria pagode`\n\n"
-        "\U0001f500 ZIPs grandes sao divididos automaticamente em partes de 500 musicas.\n\n"
-        "As musicas vem com a capa do album e nome correto!",
+        "Olá! Eu sou o bot TM-Infinity. 🎵🎥🎬\n\n"
+        "Envie-me o **nome da música**, um **link** ou uma **categoria** para baixar!\n\n"
+        "✅ **Suporte para:**\n"
+        "- YouTube (Música, Vídeo e Playlists)\n"
+        "- Instagram (Reels e Vídeos)\n"
+        "- TikTok (Vídeos)\n"
+        "- **Categorias:** Digite o nome de um gênero (ex: Sertanejo) para baixar 200 músicas em .zip!\n\n"
+        "As músicas vêm com a capa do álbum e nome correto!",
         parse_mode='Markdown'
     )
 
-
-async def handle_user_input(update, context):
+async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_input = update.message.text
     context.user_data["user_input"] = user_input
-
+    
+    # Detectar se é link do Instagram ou TikTok
     is_social = any(x in user_input.lower() for x in ["instagram.com", "tiktok.com"])
-
+    
     keyboard = []
     if is_social:
-        keyboard.append([InlineKeyboardButton("Baixar Video", callback_data="download_video")])
+        keyboard.append([InlineKeyboardButton("Baixar Vídeo", callback_data="download_video")])
     else:
+        # Se for um link de playlist do YouTube
         if "list=" in user_input.lower() or "playlist" in user_input.lower():
-            keyboard.append([InlineKeyboardButton("Baixar Playlist (Audio)", callback_data="download_playlist_audio")])
-            keyboard.append([InlineKeyboardButton("Baixar Playlist (Video)", callback_data="download_playlist_video")])
-            keyboard.append([InlineKeyboardButton("\U0001f4e6 Baixar Playlist como ZIP", callback_data="download_playlist_zip")])
+            keyboard.append([InlineKeyboardButton("Baixar Playlist (Áudio)", callback_data="download_playlist_audio")])
+            keyboard.append([InlineKeyboardButton("Baixar Playlist (Vídeo)", callback_data="download_playlist_video")])
         else:
-            keyboard.append([InlineKeyboardButton("Baixar como Musica (MP3)", callback_data="download_audio")])
-            keyboard.append([InlineKeyboardButton("Baixar como Video (MP4)", callback_data="download_video")])
-
+            keyboard.append([InlineKeyboardButton("Baixar como Música (MP3)", callback_data="download_audio")])
+            keyboard.append([InlineKeyboardButton("Baixar como Vídeo (MP4)", callback_data="download_video")])
+            # Adicionar opção de baixar 200 músicas por categoria
+            keyboard.append([InlineKeyboardButton(f"Baixar 200 músicas de '{user_input}' (.zip)", callback_data="download_category_zip")])
+        
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("O que voce deseja baixar?", reply_markup=reply_markup)
+    await update.message.reply_text(f"O que você deseja baixar?", reply_markup=reply_markup)
 
-
-async def button_callback_handler(update, context):
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     data = query.data
     user_input = context.user_data.get("user_input")
-
+    
     if not user_input:
-        await query.edit_message_text("Erro ao recuperar a solicitacao. Envie o nome ou link novamente.")
+        await query.edit_message_text("Erro ao recuperar a solicitação. Envie o nome ou link novamente.")
         return
 
-    await query.edit_message_text("Iniciando processamento...")
+    await query.edit_message_text(f"Iniciando processamento...")
     asyncio.create_task(run_download(query, user_input, data, context))
 
+# --- Lógica de Download ---
 
 async def run_download(query, user_input, download_type, context):
-    if download_type == "download_playlist_zip":
-        await process_playlist_zip(query, user_input, context)
+    if download_type == "download_category_zip":
+        await process_category_zip(query, user_input, context)
     elif download_type.startswith("download_playlist"):
         media_type = "download_audio" if "audio" in download_type else "download_video"
         await process_playlist(query, user_input, media_type, context)
     else:
         await process_single_item(query, user_input, download_type, context)
 
-
-async def cmd_categoria(update, context):
-    if not context.args:
-        await update.message.reply_text(
-            "\u274c Informe o genero musical!\n\n"
-            "Exemplo: `/categoria funk`\n"
-            "Outros: sertanejo, pagode, rap, forro, rock, pop, gospel",
-            parse_mode='Markdown'
-        )
-        return
-
-    categoria = " ".join(context.args)
-    await update.message.reply_text(
-        "\U0001f3b6 Iniciando download em massa de **{}**...\n"
-        "\U0001f3b5 Quantidade: {} musicas\n"
-        "\U0001f4e6 ZIPs de ate {} musicas cada\n\n"
-        "\u23f3 Isso pode levar bastante tempo - aguarde as partes chegando!".format(
-            categoria.upper(), CATEGORIA_QUANTIDADE, ZIP_PARTE_TAMANHO
-        ),
-        parse_mode='Markdown'
-    )
-    asyncio.create_task(process_categoria_zip(update, categoria, context))
-
-
-async def process_categoria_zip(update, categoria, context):
-    loop = asyncio.get_running_loop()
-    status_msg = await update.message.reply_text("\U0001f50d Buscando musicas de '{}'...".format(categoria))
-
-    search_query = "ytsearch{}:{}".format(CATEGORIA_QUANTIDADE, categoria)
-    ydl_search_opts = {"quiet": True, "extract_flat": True}
-
-    try:
-        with YoutubeDL(ydl_search_opts) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False))
-
-        entries = info.get('entries', [])
-        if not entries:
-            await status_msg.edit_text("\u274c Nenhum resultado encontrado para essa categoria.")
-            return
-
-        total = len(entries)
-        await status_msg.edit_text("\u2705 Encontradas {} musicas. Baixando... {}".format(total, create_progress_bar(0)))
-
-        downloaded_files = []
-        erros = 0
-
-        for i, entry in enumerate(entries):
-            if not entry:
-                continue
-            url = entry.get('url') or entry.get('webpage_url')
-            if not url and entry.get('id'):
-                url = "https://www.youtube.com/watch?v={}".format(entry.get('id'))
-            if not url:
-                continue
-
-            try:
-                await status_msg.edit_text(
-                    "\u2b07\ufe0f Baixando {}/{}...\n{}\n\U0001f3b5 {}".format(
-                        i + 1, total,
-                        create_progress_bar((i + 1) / total),
-                        str(entry.get('title', 'Desconhecido'))[:50]
-                    )
-                )
-            except Exception:
-                pass
-
-            file_path = await download_audio_file(url, loop)
-            if file_path:
-                downloaded_files.append(file_path)
-            else:
-                erros += 1
-
-        if not downloaded_files:
-            await status_msg.edit_text("\u274c Nenhum arquivo foi baixado com sucesso.")
-            return
-
-        base_nome = categoria.replace(' ', '_')
-        await enviar_zips_divididos(
-            message=update.message,
-            status_msg=status_msg,
-            downloaded_files=downloaded_files,
-            base_nome=base_nome,
-            titulo=categoria.upper(),
-            erros=erros,
-            loop=loop
-        )
-
-    except Exception as e:
-        logger.error("Erro no download por categoria: {}".format(e))
-        await status_msg.edit_text("\u274c Erro ao processar categoria: {}".format(str(e)[:150]))
-
-
-async def download_audio_file(url, loop):
+async def process_category_zip(query, category, context):
+    status_msg = await query.message.reply_text(f"🔍 Buscando 200 músicas da categoria: {category}...")
+    
+    # Criar pasta temporária para a categoria
+    category_dir = os.path.join(DOWNLOAD_DIR, f"category_{query.from_user.id}_{int(asyncio.get_event_loop().time())}")
+    if not os.path.exists(category_dir):
+        os.makedirs(category_dir)
+    
     ydl_opts = {
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(category_dir, "%(title)s.%(ext)s"),
         "quiet": True,
         "noplaylist": True,
-        "retries": 5,
-        "socket_timeout": 30,
         "ignoreerrors": True,
-        "format": "bestaudio/best",
-        "writethumbnail": True,
         "postprocessors": [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"},
-            {"key": "EmbedThumbnail"},
+            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "128"}, # Qualidade menor para o zip não ficar gigante
             {"key": "FFmpegMetadata"}
         ],
     }
+
     try:
+        loop = asyncio.get_running_loop()
+        search_query = f"ytsearch200:{category}"
+        
         with YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=True))
-            if not info:
-                return None
-            if 'entries' in info:
-                if not info['entries']:
-                    return None
-                info = info['entries'][0]
-            file_path = ydl.prepare_filename(info)
-            base, _ = os.path.splitext(file_path)
-            mp3_path = base + ".mp3"
-            if os.path.exists(mp3_path):
-                return mp3_path
-            for ext in ['.mp3', '.m4a', '.webm', '.opus']:
-                if os.path.exists(base + ext):
-                    return base + ext
-        return None
+            await status_msg.edit_text(f"⏳ Baixando 200 músicas de '{category}'... Isso pode demorar um pouco.")
+            await loop.run_in_executor(None, lambda: ydl.download([search_query]))
+        
+        # Criar o arquivo ZIP
+        zip_filename = f"{category.replace(' ', '_')}_200_musicas.zip"
+        zip_path = os.path.join(DOWNLOAD_DIR, zip_filename)
+        
+        await status_msg.edit_text(f"📦 Compactando músicas em {zip_filename}...")
+        
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, dirs, files in os.walk(category_dir):
+                for file in files:
+                    if file.endswith(".mp3"):
+                        zipf.write(os.path.join(root, file), file)
+        
+        # Enviar o arquivo ZIP
+        await status_msg.edit_text(f"📤 Enviando arquivo ZIP...")
+        with open(zip_path, "rb") as f:
+            await query.message.reply_document(document=f, filename=zip_filename, caption=f"✅ Aqui estão as 200 músicas de: {category}")
+        
+        # Limpeza
+        await status_msg.delete()
+        os.remove(zip_path)
+        shutil.rmtree(category_dir)
+        
     except Exception as e:
-        logger.warning("Erro ao baixar {}: {}".format(url, e))
-        return None
-
-
-async def process_playlist_zip(query, playlist_url, context):
-    loop = asyncio.get_running_loop()
-    status_msg = await query.message.reply_text("\U0001f4cb Extraindo itens da playlist...")
-
-    ydl_opts = {"quiet": True, "extract_flat": True}
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(playlist_url, download=False))
-
-        entries = info.get('entries', [])
-        if not entries:
-            await status_msg.edit_text("\u274c Nao foi possivel encontrar itens nesta playlist.")
-            return
-
-        total = len(entries)
-        playlist_title = info.get('title', 'playlist')
-        await status_msg.edit_text("\u2705 {} musicas encontradas. Baixando...".format(total))
-
-        downloaded_files = []
-        erros = 0
-
-        for i, entry in enumerate(entries):
-            if not entry:
-                continue
-            url = entry.get('url') or entry.get('webpage_url')
-            if not url and entry.get('id'):
-                url = "https://www.youtube.com/watch?v={}".format(entry.get('id'))
-            if not url:
-                continue
-
-            try:
-                await status_msg.edit_text(
-                    "\u2b07\ufe0f Baixando {}/{}...\n{}\n\U0001f3b5 {}".format(
-                        i + 1, total,
-                        create_progress_bar((i + 1) / total),
-                        str(entry.get('title', ''))[:50]
-                    )
-                )
-            except Exception:
-                pass
-
-            file_path = await download_audio_file(url, loop)
-            if file_path:
-                downloaded_files.append(file_path)
-            else:
-                erros += 1
-
-        if not downloaded_files:
-            await status_msg.edit_text("\u274c Nenhum arquivo foi baixado com sucesso.")
-            return
-
-        base_nome = re.sub(r'[^a-zA-Z0-9_]', '_', playlist_title)[:40]
-        await enviar_zips_divididos(
-            message=query.message,
-            status_msg=status_msg,
-            downloaded_files=downloaded_files,
-            base_nome=base_nome,
-            titulo=playlist_title,
-            erros=erros,
-            loop=loop
-        )
-
-    except Exception as e:
-        logger.error("Erro na playlist ZIP: {}".format(e))
-        await status_msg.edit_text("\u274c Erro ao processar playlist: {}".format(str(e)[:150]))
-
+        logger.error(f"Erro ao processar categoria: {e}")
+        await query.message.reply_text(f"Erro ao baixar categoria: {str(e)[:100]}")
+        if os.path.exists(category_dir):
+            shutil.rmtree(category_dir)
 
 async def process_playlist(query, playlist_url, media_type, context):
     initial_msg = await query.message.reply_text("Extraindo itens da playlist...")
@@ -437,33 +177,34 @@ async def process_playlist(query, playlist_url, media_type, context):
         loop = asyncio.get_running_loop()
         with YoutubeDL(ydl_opts) as ydl:
             info = await loop.run_in_executor(None, lambda: ydl.extract_info(playlist_url, download=False))
-
+        
         entries = info.get('entries', [])
         if not entries:
-            await initial_msg.edit_text("Nao foi possivel encontrar itens nesta playlist.")
+            await initial_msg.edit_text("Não foi possível encontrar itens nesta playlist.")
             return
-
+        
         total = len(entries)
-        await initial_msg.edit_text("Encontrados {} itens. Iniciando downloads...".format(total))
-
+        await initial_msg.edit_text(f"Encontrados {total} itens. Iniciando downloads...")
+        
         for i, entry in enumerate(entries):
             if entry:
                 url = entry.get('url') or entry.get('webpage_url')
                 if not url and entry.get('id'):
-                    url = "https://www.youtube.com/watch?v={}".format(entry.get('id'))
+                    url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                
                 if url:
                     await process_single_item(query, url, media_type, context, is_playlist=True, index=i+1, total=total)
-
-        await query.message.reply_text("\u2705 Download da playlist finalizado!")
+        
+        await query.message.reply_text(f"✅ Download da playlist finalizado!")
     except Exception as e:
-        logger.error("Erro na playlist: {}".format(e))
-        await initial_msg.edit_text("Erro ao processar playlist: {}...".format(str(e)[:100]))
-
+        logger.error(f"Erro na playlist: {e}")
+        await initial_msg.edit_text(f"Erro ao processar playlist: {str(e)[:100]}...")
 
 async def process_single_item(query, input_data, download_type, context, is_playlist=False, index=0, total=0):
     loop = asyncio.get_running_loop()
     is_url = re.match(r"https?://", input_data)
-
+    
+    # Opções base do yt-dlp
     ydl_opts = {
         "outtmpl": os.path.join(DOWNLOAD_DIR, "%(title)s.%(ext)s"),
         "quiet": True,
@@ -473,7 +214,10 @@ async def process_single_item(query, input_data, download_type, context, is_play
         "ignoreerrors": True,
     }
 
-    search_query = input_data if is_url else "ytsearch1:{}".format(input_data)
+    if not is_url:
+        search_query = f"ytsearch1:{input_data}"
+    else:
+        search_query = input_data
 
     if download_type == "download_audio":
         ydl_opts.update({
@@ -490,27 +234,32 @@ async def process_single_item(query, input_data, download_type, context, is_play
             "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "merge_output_format": "mp4",
         })
-
+    
     try:
         with YoutubeDL(ydl_opts) as ydl:
+            # Extrair informações primeiro para obter o título e garantir que existe resultado
             info_dict = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False))
+            
             if not info_dict:
                 raise Exception("Nenhum resultado encontrado.")
+
+            # Se for busca, o resultado está em 'entries'
             if 'entries' in info_dict:
                 if not info_dict['entries']:
-                    raise Exception("Busca nao retornou resultados.")
+                    raise Exception("Busca não retornou resultados.")
                 info = info_dict['entries'][0]
             else:
                 info = info_dict
 
-            dl_url = info['webpage_url'] if 'webpage_url' in info else search_query
-            await loop.run_in_executor(None, lambda: ydl.download([dl_url]))
-
+            # Agora faz o download real
+            await loop.run_in_executor(None, lambda: ydl.download([info['webpage_url'] if 'webpage_url' in info else search_query]))
+            
             file_path = ydl.prepare_filename(info)
             if download_type == "download_audio":
                 base, _ = os.path.splitext(file_path)
                 file_path = base + ".mp3"
-
+            
+            # Verificação de segurança para extensões variadas
             if not os.path.exists(file_path):
                 base, _ = os.path.splitext(file_path)
                 for ext in ['.mp3', '.mp4', '.mkv', '.webm', '.m4a']:
@@ -520,14 +269,12 @@ async def process_single_item(query, input_data, download_type, context, is_play
 
             if os.path.exists(file_path):
                 title = info.get('title', 'Arquivo')
-                if is_playlist:
-                    caption = "\U0001f4e6 Item {}/{}\n\U0001f3b5 {}".format(index, total, title)
-                else:
-                    caption = "\u2705 Aqui esta: {}".format(title)
-
+                caption = f"📦 Item {index}/{total}\n🎵 {title}" if is_playlist else f"✅ Aqui está: {title}"
+                
                 with open(file_path, "rb") as f:
                     if download_type == "download_audio" and file_path.endswith(".mp3"):
                         sent = await query.message.reply_audio(audio=f, title=title, caption=caption)
+                        # Notifica o bot de divulgação automaticamente
                         notify_divulgacao(
                             chat_id=query.message.chat_id,
                             file_id=sent.audio.file_id,
@@ -536,35 +283,31 @@ async def process_single_item(query, input_data, download_type, context, is_play
                         )
                     else:
                         await query.message.reply_video(video=f, caption=caption)
-
+                
                 try:
                     os.remove(file_path)
                     base_path = os.path.splitext(file_path)[0]
                     for ext in ['.jpg', '.webp', '.png', '.temp']:
-                        if os.path.exists(base_path + ext):
-                            os.remove(base_path + ext)
-                except Exception:
+                        if os.path.exists(base_path + ext): os.remove(base_path + ext)
+                except:
                     pass
             else:
                 if not is_playlist:
-                    await query.message.reply_text("Erro: O arquivo nao foi gerado corretamente.")
+                    await query.message.reply_text(f"Erro: O arquivo não foi gerado corretamente.")
 
     except Exception as e:
-        logger.error("Erro no item: {}".format(e))
+        logger.error(f"Erro no item: {e}")
         if not is_playlist:
-            await query.message.reply_text("Desculpe, ocorreu um erro: {}".format(str(e)[:100]))
+            await query.message.reply_text(f"Desculpe, ocorreu um erro: {str(e)[:100]}")
 
-
-def main():
+def main() -> None:
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("categoria", cmd_categoria))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_input))
     application.add_handler(CallbackQueryHandler(button_callback_handler))
+
     logger.info("Bot TM-Infinity iniciado...")
     application.run_polling()
 
-
 if __name__ == "__main__":
     main()
-
