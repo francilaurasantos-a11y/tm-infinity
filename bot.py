@@ -135,13 +135,8 @@ async def enviar_zips_divididos(message, status_msg, downloaded_files, base_nome
         zip_size_mb = zip_size_bytes / (1024 * 1024)
 
         if zip_size_bytes > 50 * 1024 * 1024:
-            await message.reply_text(
-                "⚠️ ZIP {} ({:.1f} MB) e maior que 50 MB.
-"
-                "O Telegram nao aceita arquivos acima de 50 MB via bot.
-"
-                "Tente reduzir ZIP_PARTE_TAMANHO no codigo.".format(zip_name, zip_size_mb)
-            )
+            aviso = "ZIP {} ({:.1f} MB) maior que 50 MB. Telegram nao aceita. Reduza ZIP_PARTE_TAMANHO.".format(zip_name, zip_size_mb)
+            await message.reply_text(aviso)
             zips_criados.append(zip_path)
             continue
 
